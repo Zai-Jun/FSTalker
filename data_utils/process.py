@@ -2,12 +2,9 @@ import os
 import glob
 import tqdm
 import json
-
 import argparse
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 def extract_audio(path, out_path, sample_rate=16000):
     
@@ -140,14 +137,11 @@ def extract_torso_and_gt(base_dir, ori_imgs_dir):
 
         # read semantics
         seg = cv2.imread(image_path.replace('ori_imgs', 'parsing').replace('.jpg', '.png'))
-        mask_img = np.zeros_like(seg)
         head_part = (seg[..., 0] == 255) & (seg[..., 1] == 0) & (seg[..., 2] == 0)
         neck_part = (seg[..., 0] == 0) & (seg[..., 1] == 255) & (seg[..., 2] == 0)
         torso_part = (seg[..., 0] == 0) & (seg[..., 1] == 0) & (seg[..., 2] == 255)
         bg_part = (seg[..., 0] == 255) & (seg[..., 1] == 255) & (seg[..., 2] == 255)
 
-        mask_img[head_part, :] = 255
-        cv2.imwrite(image_path.replace('ori_imgs', 'face_mask').replace('.jpg', '.png'), mask_img)
         # get gt image
         gt_image = ori_image.copy()
         gt_image[bg_part] = bg_image[bg_part]
@@ -264,100 +258,6 @@ def face_tracking(ori_imgs_dir):
 
     print(f'[INFO] ===== finished face tracking =====')
 
-# ref: https://github.com/ShunyuYao/DFA-NeRF
-def extract_flow(base_dir,ori_imgs_dir,mask_dir, flow_dir):
-    print(f'[INFO] ===== extract flow =====')
-    torch.cuda.empty_cache()
-    ref_id = 2
-    image_paths = glob.glob(os.path.join(ori_imgs_dir, '*.jpg'))
-    tmp_image = cv2.imread(image_paths[0], cv2.IMREAD_UNCHANGED) # [H, W, 3]
-    h, w = tmp_image.shape[:2]
-    valid_img_ids = []
-    for i in range(100000):
-        if os.path.isfile(os.path.join(ori_imgs_dir, '{:d}.lms'.format(i))):
-            valid_img_ids.append(i)
-    valid_img_num = len(valid_img_ids)
-    with open(os.path.join(base_dir, 'flow_list.txt'), 'w') as file:
-        for i in range(0, valid_img_num):
-            file.write(base_dir + '/ori_imgs/' + '{:d}.jpg '.format(ref_id) +
-                       base_dir + '/face_mask/' + '{:d}.png '.format(ref_id) +
-                       base_dir + '/ori_imgs/' + '{:d}.jpg '.format(i) +
-                       base_dir + '/face_mask/' + '{:d}.png\n'.format(i))
-        file.close()
-    ext_flow_cmd = 'python data_utils/UNFaceFlow/test_flow.py --datapath=' + base_dir + '/flow_list.txt ' + \
-        '--savepath=' + base_dir + '/flow_result' + \
-        ' --width=' + str(w) + ' --height=' + str(h)
-    os.system(ext_flow_cmd)
-    face_img = cv2.imread(os.path.join(ori_imgs_dir, '{:d}.jpg'.format(ref_id)))
-    face_img_mask = cv2.imread(os.path.join(mask_dir, '{:d}.png'.format(ref_id)))
-
-    rigid_mask = face_img_mask[..., 0] > 250
-    rigid_num = np.sum(rigid_mask)
-    flow_frame_num = 2500
-    flow_frame_num = min(flow_frame_num, valid_img_num)
-    rigid_flow = np.zeros((flow_frame_num, 2, rigid_num), np.float32)
-    for i in range(flow_frame_num):
-        flow = np.load(os.path.join(flow_dir, '{:d}_{:d}.npy'.format(ref_id, valid_img_ids[i])))
-        rigid_flow[i] = flow[:, rigid_mask]
-    rigid_flow = rigid_flow.transpose((2, 1, 0))
-    rigid_flow = torch.as_tensor(rigid_flow).cuda()
-    lap_kernel = torch.Tensor(
-        (-0.5, 1.0, -0.5)).unsqueeze(0).unsqueeze(0).float().cuda()
-    flow_lap = F.conv1d(
-        rigid_flow.reshape(-1, 1, rigid_flow.shape[-1]), lap_kernel)
-    flow_lap = flow_lap.view(rigid_flow.shape[0], 2, -1)
-    flow_lap = torch.norm(flow_lap, dim=1)
-    valid_frame = torch.mean(flow_lap, dim=0) < (torch.mean(flow_lap) * 3)
-    flow_lap = flow_lap[:, valid_frame]
-    rigid_flow_mean = torch.mean(flow_lap, dim=1)
-    rigid_flow_show = (rigid_flow_mean - torch.min(rigid_flow_mean)) / \
-                      (torch.max(rigid_flow_mean) - torch.min(rigid_flow_mean)) * 255
-    rigid_flow_show = rigid_flow_show.byte().cpu().numpy()
-    rigid_flow_img = np.zeros((h, w, 1), dtype=np.uint8)
-    rigid_flow_img[...] = 255
-    rigid_flow_img[rigid_mask, 0] = rigid_flow_show
-    cv2.imwrite(os.path.join(base_dir, 'rigid_flow.jpg'), rigid_flow_img)
-    win_size, d_size = 5, 5
-    sel_xys = np.zeros((h, w), dtype=np.int32)
-    xys = []
-    for y in range(0, h - win_size, win_size):
-        for x in range(0, w - win_size, win_size):
-            min_v = int(40)
-            id_x = -1
-            id_y = -1
-            for dy in range(0, win_size):
-                for dx in range(0, win_size):
-                    if rigid_flow_img[y + dy, x + dx, 0] < min_v:
-                        min_v = rigid_flow_img[y + dy, x + dx, 0]
-                        id_x = x + dx
-                        id_y = y + dy
-            if id_x >= 0:
-                if (np.sum(sel_xys[id_y - d_size:id_y + d_size + 1, id_x - d_size:id_x + d_size + 1]) == 0):
-                    cv2.circle(face_img, (id_x, id_y), 1, (255, 0, 0))
-                    xys.append(np.array((id_x, id_y), np.int32))
-                    sel_xys[id_y, id_x] = 1
-
-    cv2.imwrite(os.path.join(base_dir, 'keypts.jpg'), face_img)
-    np.savetxt(os.path.join(base_dir, 'keypoints.txt'), xys, '%d')
-    key_xys = np.loadtxt(os.path.join(base_dir, 'keypoints.txt'), np.int32)
-    track_xys = np.zeros((valid_img_num, key_xys.shape[0], 2), dtype=np.float32)
-    track_dir = os.path.join(base_dir,'flow_result')
-    track_paths = sorted(glob.glob(os.path.join(track_dir, '*.npy')), key=lambda x: int(x.replace('\\', '/').split('/')[-1].split('.')[0]))
-
-    for i, path in enumerate(track_paths):
-
-        flow = np.load(path)
-        for j in range(key_xys.shape[0]):
-            x = key_xys[j, 0]
-            y = key_xys[j, 1]
-            track_xys[i, j, 0] = x + flow[0, y, x]
-            track_xys[i, j, 1] = y + flow[1, y, x]
-    np.save(os.path.join(base_dir, 'track_xys.npy'), track_xys)
-
-    pose_opt_cmd = 'python data_utils/face_tracking/bundle_adjustment.py --path=' + base_dir + ' --img_h=' + \
-        str(h) + ' --img_w=' + str(w)
-    os.system(pose_opt_cmd)
-
 
 def save_transforms(base_dir, ori_imgs_dir):
     print(f'[INFO] ===== save transforms =====')
@@ -370,9 +270,7 @@ def save_transforms(base_dir, ori_imgs_dir):
     tmp_image = cv2.imread(image_paths[0], cv2.IMREAD_UNCHANGED) # [H, W, 3]
     h, w = tmp_image.shape[:2]
 
-    #params_dict = torch.load(os.path.join(base_dir, 'track_params.pt'))
-    params_dict = torch.load(os.path.join(base_dir, 'bundle_adjustment.pt'))  # <--- 读取 BA 结果
-
+    params_dict = torch.load(os.path.join(base_dir, 'track_params.pt'))
     focal_len = params_dict['focal']
     euler_angle = params_dict['euler']
     trans = params_dict['trans'] / 10.0
@@ -462,17 +360,11 @@ if __name__ == '__main__':
     parsing_dir = os.path.join(base_dir, 'parsing')
     gt_imgs_dir = os.path.join(base_dir, 'gt_imgs')
     torso_imgs_dir = os.path.join(base_dir, 'torso_imgs')
-    # 在 torso_imgs_dir 定义后添加：
-    mask_imgs_dir = os.path.join(base_dir, 'face_mask')  # InsTaG 原代码中生成了mask但未在main定义变量
-    flow_dir = os.path.join(base_dir, 'flow_result')
 
     os.makedirs(ori_imgs_dir, exist_ok=True)
     os.makedirs(parsing_dir, exist_ok=True)
     os.makedirs(gt_imgs_dir, exist_ok=True)
     os.makedirs(torso_imgs_dir, exist_ok=True)
-    # 在 makedirs 区域添加：
-    os.makedirs(mask_imgs_dir, exist_ok=True)
-    os.makedirs(flow_dir, exist_ok=True)
 
 
     # extract audio
@@ -507,20 +399,7 @@ if __name__ == '__main__':
     if opt.task == -1 or opt.task == 8:
         face_tracking(ori_imgs_dir)
 
-    # face tracking (task 8)
-    if opt.task == -1 or opt.task == 8:
-        face_tracking(ori_imgs_dir)
-
-    # [新增] extract flow & pose optimization (逻辑上是 task 8.5，可以手动指定或随 -1 执行)
-    # 注意：这里需要确保 extract_torso_and_gt (task 6) 已经运行过，因为它生成了 face_mask
-    if opt.task == -1 or opt.task == 9:
-        extract_flow(base_dir, ori_imgs_dir, mask_imgs_dir, flow_dir)
-
-    # save transforms.json (task 9)
-    if opt.task == -1 or opt.task == 10:
-        save_transforms(base_dir, ori_imgs_dir)
-
     # save transforms.json
-    if opt.task == -1 or opt.task == 10:
+    if opt.task == -1 or opt.task == 9:
         save_transforms(base_dir, ori_imgs_dir)
 

@@ -1,16 +1,4 @@
-#include <glm/detail/setup.hpp>
-
-#if GLM_PLATFORM & GLM_PLATFORM_APPLE // Fail on Github macOS-latest (macOS-13 was fine)
-int main()
-{
-	return 0;
-}
-#else
-
-#ifndef GLM_FORCE_PURE
 #define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
-#endif
-
 #include <glm/glm.hpp>
 
 #if GLM_CONFIG_ALIGNED_GENTYPES == GLM_ENABLE
@@ -65,11 +53,6 @@ static int test_vec3_aligned()
 {
 	int Error = 0;
 
-#if GLM_COMPILER & GLM_COMPILER_CLANG
-#	pragma clang diagnostic push
-#	pragma clang diagnostic ignored "-Wpadded"
-#endif
-
 	struct Struct1
 	{
 		glm::vec4 A;
@@ -77,17 +60,8 @@ static int test_vec3_aligned()
 		glm::vec3 C;
 	};
 
-#if GLM_COMPILER & GLM_COMPILER_CLANG
-#	pragma clang diagnostic pop
-#endif
-
 	std::size_t const Size1 = sizeof(Struct1);
 	Error += Size1 == 48 ? 0 : 1;
-
-#if GLM_COMPILER & GLM_COMPILER_CLANG
-#	pragma clang diagnostic push
-#	pragma clang diagnostic ignored "-Wpadded"
-#endif
 
 	struct Struct2
 	{
@@ -95,10 +69,6 @@ static int test_vec3_aligned()
 		glm::vec3 B;
 		float C;
 	};
-
-#if GLM_COMPILER & GLM_COMPILER_CLANG
-#	pragma clang diagnostic pop
-#endif
 
 	std::size_t const Size2 = sizeof(Struct2);
 	Error += Size2 == 48 ? 0 : 1;
@@ -120,5 +90,3 @@ int main()
 
 	return Error;
 }
-
-#endif//GLM_PLATFORM & GLM_PLATFORM_APPLE

@@ -4,79 +4,6 @@ import torch.nn.functional as F
 
 from encoding import get_encoder
 
-
-# 新增频率编码器（参考频率版）
-def get_embedder(multires, i=3):
-    if multires == 0:
-        return nn.Identity(), 3
-
-    embed_kwargs = {
-        'include_input': True,
-        'input_dims': i,
-        'max_freq_log2': multires - 1,
-        'num_freqs': multires,
-        'log_sampling': True,
-        'periodic_fns': [torch.sin, torch.cos],
-    }
-
-    embedder_obj = Embedder(**embed_kwargs)
-    embed = lambda x: embedder_obj.embed(x)
-    return embed, embedder_obj.out_dim
-
-
-class Embedder:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.create_embedding_fn()
-
-    def create_embedding_fn(self):
-        embed_fns = []
-        d = self.kwargs['input_dims']
-        out_dim = 0
-        if self.kwargs['include_input']:
-            embed_fns.append(lambda x: x)
-            out_dim += d
-
-        max_freq = self.kwargs['max_freq_log2']
-        N_freqs = self.kwargs['num_freqs']
-
-        if self.kwargs['log_sampling']:
-            freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs)
-        else:
-            freq_bands = torch.linspace(2. ** 0., 2. ** max_freq, steps=N_freqs)
-
-        for freq in freq_bands:
-            for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
-
-        self.embed_fns = embed_fns
-        self.out_dim = out_dim
-
-    def embed(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
-
-
-class Conv2d(nn.Module):
-    def __init__(self, cin, cout, kernel_size, stride, padding, residual=False, leakyReLU=False, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(cin, cout, kernel_size, stride, padding),
-            nn.BatchNorm2d(cout)
-        )
-        if leakyReLU:
-            self.act = nn.LeakyReLU(0.02)
-        else:
-            self.act = nn.ReLU()
-        self.residual = residual
-
-    def forward(self, x):
-        out = self.conv_block(x)
-        if self.residual:
-            out += x
-        return self.act(out)
-
-
 # Audio feature extractor
 class AudioAttNet(nn.Module):
     def __init__(self, dim_aud=64, seq_len=8):
@@ -104,7 +31,36 @@ class AudioAttNet(nn.Module):
         # x: [1, seq_len, dim_aud]
         y = x.permute(0, 2, 1)  # [1, dim_aud, seq_len]
         y = self.attentionConvNet(y)
-        y = self.attentionNet(y.view(1, self.seq_len)).view(1, self.seq_len, 1)
+
+        # 1. 动态获取当前真实的特征维度，防止 hardcode 的 seq_len 带来动态输入截断错误
+        current_seq_len = y.numel()
+
+        # 2. 将输入展平并确保内存物理连续
+        out = y.contiguous().view(1, current_seq_len)
+
+        # 3. 核心隔离区：解构 attentionNet，用纯张量操作替换全连接层，彻底绕过 cuBLAS 崩溃
+        for layer in self.attentionNet:
+            if isinstance(layer, torch.nn.Linear):
+                # 原始逻辑：out = F.linear(out, layer.weight, layer.bias) -> 会调用崩溃的 cuBLAS
+                # 替换逻辑：使用基础矩阵空间广播进行纯数学模拟
+
+                # out 的形状从 [1, in_features] 变为 [1, in_features, 1]
+                # weight.T 的形状从 [in_features, out_features] 变为 [1, in_features, out_features]
+                w = layer.weight.T.unsqueeze(0)
+
+                # Element-wise 相乘后在 in_features 维度求和，结果严格等价于矩阵乘法 [1, out_features]
+                out = torch.sum(out.unsqueeze(2) * w, dim=1)
+
+                # 若存在偏置项，进行广播相加
+                if layer.bias is not None:
+                    out = out + layer.bias.unsqueeze(0)
+            else:
+                # 遇到其他层（如 Softmax, ReLU、Dropout 等）正常前向传播
+                out = layer(out)
+
+        # 4. 恢复为最终参与音频特征加权相乘的维度
+        y = out.view(1, current_seq_len, 1)
+
         return torch.sum(y * x, dim=1)  # [1, dim_aud]
 
 
@@ -115,12 +71,11 @@ class AudioNet(nn.Module):
         self.win_size = win_size
         self.dim_aud = dim_aud
         self.encoder_conv = nn.Sequential(  # n x 29 x 16
-            nn.Conv1d(dim_in, 32 if dim_in < 128 else 128, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 8
+            nn.Conv1d(dim_in, 32, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 8
             nn.LeakyReLU(0.02, True),
-            nn.Conv1d(32 if dim_in < 128 else 128, 32 if dim_in < 128 else 128, kernel_size=3, stride=2, padding=1,
-                      bias=True),  # n x 32 x 4
+            nn.Conv1d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),  # n x 32 x 4
             nn.LeakyReLU(0.02, True),
-            nn.Conv1d(32 if dim_in < 128 else 128, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 2
+            nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 2
             nn.LeakyReLU(0.02, True),
             nn.Conv1d(64, 64, kernel_size=3, stride=2, padding=1, bias=True),  # n x 64 x 1
             nn.LeakyReLU(0.02, True),
@@ -132,62 +87,10 @@ class AudioNet(nn.Module):
         )
 
     def forward(self, x):
-        half_w = int(self.win_size / 2)
-        x = x[:, :, 8 - half_w:8 + half_w]
+        half_w = int(self.win_size/2)
+        x = x[:, :, 8-half_w:8+half_w]
         x = self.encoder_conv(x).squeeze(-1)
         x = self.encoder_fc1(x)
-        return x
-
-
-class AudioEncoder(nn.Module):
-    def __init__(self):
-        super(AudioEncoder, self).__init__()
-
-        self.audio_encoder = nn.Sequential(
-            Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
-            Conv2d(32, 32, kernel_size=3, stride=1, padding=1, residual=True),
-            Conv2d(32, 32, kernel_size=3, stride=1, padding=1, residual=True),
-
-            Conv2d(32, 64, kernel_size=3, stride=(3, 1), padding=1),
-            Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
-            Conv2d(64, 64, kernel_size=3, stride=1, padding=1, residual=True),
-
-            Conv2d(64, 128, kernel_size=3, stride=3, padding=1),
-            Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True),
-            Conv2d(128, 128, kernel_size=3, stride=1, padding=1, residual=True),
-
-            Conv2d(128, 256, kernel_size=3, stride=(3, 2), padding=1),
-            Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True),
-
-            Conv2d(256, 512, kernel_size=3, stride=1, padding=0),
-            Conv2d(512, 512, kernel_size=1, stride=1, padding=0), )
-
-    def forward(self, x):
-        out = self.audio_encoder(x)
-        out = out.squeeze(2).squeeze(2)
-
-        return out
-
-
-# Audio feature extractor
-class AudioNet_ave(nn.Module):
-    def __init__(self, dim_in=29, dim_aud=64, win_size=16):
-        super(AudioNet_ave, self).__init__()
-        self.win_size = win_size
-        self.dim_aud = dim_aud
-        self.encoder_fc1 = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.LeakyReLU(0.02, True),
-            nn.Linear(256, 128),
-            nn.LeakyReLU(0.02, True),
-            nn.Linear(128, dim_aud),
-        )
-
-    def forward(self, x):
-        # half_w = int(self.win_size/2)
-        # x = x[:, :, 8-half_w:8+half_w]
-        # x = self.encoder_conv(x).squeeze(-1)
-        x = self.encoder_fc1(x).permute(1, 0, 2).squeeze(0)
         return x
 
 
@@ -201,8 +104,7 @@ class MLP(nn.Module):
 
         net = []
         for l in range(num_layers):
-            net.append(nn.Linear(self.dim_in if l == 0 else self.dim_hidden,
-                                 self.dim_out if l == num_layers - 1 else self.dim_hidden, bias=False))
+            net.append(nn.Linear(self.dim_in if l == 0 else self.dim_hidden, self.dim_out if l == num_layers - 1 else self.dim_hidden, bias=False))
 
         self.net = nn.ModuleList(net)
 
@@ -216,707 +118,118 @@ class MLP(nn.Module):
         return x
 
 
+# ==================================================================================
+# Main Motion Network (Refactored for MoE & TimeFormer Control)
+# ==================================================================================
+
 class MotionNetwork(nn.Module):
     def __init__(self,
                  audio_dim=32,
                  ind_dim=0,
                  args=None,
-
-                 multires=10,  # 频率编码的频率数
+                 # [Debugging Switch]
+                 face_sees_audio=False,  # 如果为True，Face Expert也能看到音频(解决下颚僵硬)，为False则彻底隔离
+                 # [TimeFormer Control Switches]
+                 use_tf_mouth=True,  # 嘴部是否应用 TimeFormer 偏移 (推荐 True)
+                 use_tf_face=False  # 脸部是否应用 TimeFormer 偏移 (推荐 False，保持刚性)
                  ):
         super(MotionNetwork, self).__init__()
 
+        # --- Audio Config ---
         if 'esperanto' in args.audio_extractor:
             self.audio_in_dim = 44
         elif 'deepspeech' in args.audio_extractor:
             self.audio_in_dim = 29
         elif 'hubert' in args.audio_extractor:
             self.audio_in_dim = 1024
-        elif 'ave' in args.audio_extractor:
-            self.audio_in_dim = 32
         else:
             raise NotImplementedError
 
         self.bound = 0.15
         self.exp_eye = True
-
         self.individual_dim = ind_dim
-        if self.individual_dim > 0:
-            self.individual_codes = nn.Parameter(torch.randn(10000, self.individual_dim) * 0.1)
 
-            # audio network
+        # --- Control Flags ---
+        self.face_sees_audio = face_sees_audio
+        self.use_tf_mouth = use_tf_mouth
+        self.use_tf_face = use_tf_face
+        print(f"\n[MotionNet] Initialized MoE:")
+        print(f"  |-- Face sees Audio: {self.face_sees_audio}")
+        print(f"  |-- TimeFormer on Mouth: {self.use_tf_mouth}")
+        print(f"  |-- TimeFormer on Face:  {self.use_tf_face}")
+
+        # --- Audio Encoder ---
         self.audio_dim = audio_dim
-        if args.audio_extractor == 'ave':
-            self.audio_net = AudioNet_ave(self.audio_in_dim, self.audio_dim)
-        else:
-            self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
+        self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
         self.audio_att_net = AudioAttNet(self.audio_dim)
 
-        '''
-        # DYNAMIC PART
+        # --- Shared Spatial Encoder (HashGrid) ---
         self.num_levels = 12
         self.level_dim = 1
-        self.encoder_xy, self.in_dim_xy = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels, level_dim=self.level_dim, base_resolution=16, log2_hashmap_size=17, desired_resolution=256 * self.bound)
-        self.encoder_yz, self.in_dim_yz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels, level_dim=self.level_dim, base_resolution=16, log2_hashmap_size=17, desired_resolution=256 * self.bound)
-        self.encoder_xz, self.in_dim_xz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels, level_dim=self.level_dim, base_resolution=16, log2_hashmap_size=17, desired_resolution=256 * self.bound)
-
+        self.encoder_xy, self.in_dim_xy = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                                      level_dim=self.level_dim, base_resolution=16,
+                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
+        self.encoder_yz, self.in_dim_yz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                                      level_dim=self.level_dim, base_resolution=16,
+                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
+        self.encoder_xz, self.in_dim_xz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                                      level_dim=self.level_dim, base_resolution=16,
+                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
         self.in_dim = self.in_dim_xy + self.in_dim_yz + self.in_dim_xz
 
+        # 1. Mouth Encoders (只服务于嘴部专家)
+        self.encoder_xy_mouth, self.in_dim_xy = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                                            level_dim=self.level_dim, base_resolution=16,
+                                                            log2_hashmap_size=17, desired_resolution=256 * self.bound)
+        self.encoder_yz_mouth, self.in_dim_yz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                                            level_dim=self.level_dim, base_resolution=16,
+                                                            log2_hashmap_size=17, desired_resolution=256 * self.bound)
+        self.encoder_xz_mouth, self.in_dim_xz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                                            level_dim=self.level_dim, base_resolution=16,
+                                                            log2_hashmap_size=17, desired_resolution=256 * self.bound)
 
-        self.num_layers = 3       
+        # 2. Face Encoders (只服务于面部专家)
+        self.encoder_xy_face, _ = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                              level_dim=self.level_dim, base_resolution=16, log2_hashmap_size=17,
+                                              desired_resolution=256 * self.bound)
+        self.encoder_yz_face, _ = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                              level_dim=self.level_dim, base_resolution=16, log2_hashmap_size=17,
+                                              desired_resolution=256 * self.bound)
+        self.encoder_xz_face, _ = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
+                                              level_dim=self.level_dim, base_resolution=16, log2_hashmap_size=17,
+                                              desired_resolution=256 * self.bound)
+
+        # --- Network Definitions ---
+        self.num_layers = 3
         self.hidden_dim = 64
-        '''
-        # 位置编码（频率编码）
-        self.embed_fn, self.xyz_input_ch = get_embedder(multires, i=3)
-
+        #self.out_dim = 11  # rot: 4, xyz: 3, opac: 1, scale: 3
+        # 定义输出维度
+        self.out_dim_face = 11  # rot: 4, xyz: 3, opac: 1, scale: 3
+        self.out_dim_mouth = 3  # !!! 修改点：Mouth 只输出 XYZ !!!
+        # Expert A: Mouth Expert (Audio Driven)
+        # Input: Spatial + Audio + Individual
+        self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 32, 2)
+        self.mouth_expert_mlp = MLP(self.in_dim + self.audio_dim + self.individual_dim, self.out_dim_face, self.hidden_dim,
+                                    self.num_layers)
+        # 注意：这里输出维度改为 self.out_dim_mouth (3)
+        self.mouth_expert_mlp = MLP(self.in_dim + self.audio_dim + self.individual_dim, self.out_dim_mouth,
+                                    self.hidden_dim, self.num_layers)
+        # Expert B: Face Expert (Expression Driven)
         self.exp_in_dim = 6 - 1
         self.eye_dim = 6 if self.exp_eye else 0
-
         self.exp_encode_net = MLP(self.exp_in_dim, self.eye_dim - 1, 16, 2)
-        self.eye_att_net = MLP(self.xyz_input_ch, self.eye_dim, 16, 2)
+        self.eye_att_net = MLP(self.in_dim, self.eye_dim, 16, 2)
 
-        '''
-        self.exp_encode_net = nn.ModuleList([
-            nn.Linear(self.exp_in_dim, 16, bias=False),
-            nn.Linear(16, self.eye_dim - 1, bias=False)
-        ])
-        self.eye_att_net = nn.ModuleList([
-            nn.Linear(self.xyz_input_ch, 16, bias=False),
-            nn.Linear(16, self.eye_dim, bias=False)
-        ])
-        '''
-        '''
-        # 更深的网络结构
-        self.eye_att_net = nn.ModuleList([
-            nn.Linear(self.xyz_input_ch, 64, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 32, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, self.eye_dim, bias=False),
-            nn.Sigmoid()  # 添加Sigmoid确保输出在0-1范围内
-        ])
+        # Calculate Face Input Dimension
+        # Base: Spatial + Eye + Individual
+        face_input_dim = self.in_dim + self.eye_dim + self.individual_dim
+        if self.face_sees_audio:
+            face_input_dim += self.audio_dim  # Add Audio dim if enabled
 
-        # 更强大的网络
-        self.exp_encode_net = nn.Sequential(
-            nn.Linear(self.exp_in_dim, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 5),  # 确保输出维度是5，因为后面要与e[-1:]拼接得到6维
-            nn.Tanh()
-        )
+        self.face_expert_mlp = MLP(face_input_dim, self.out_dim_face, self.hidden_dim, self.num_layers)
 
-        # 添加眼部区域的空间偏置
-        self.eye_region_bias = nn.Parameter(torch.zeros(1, self.xyz_input_ch))
-
-        # 添加眼部区域检测网络
-        self.eye_region_detector = nn.Linear(self.xyz_input_ch, 1)
-        self.eye_region_detector = nn.Sequential(
-            nn.Linear(self.xyz_input_ch, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-
-
-        # rot: 4   xyz: 3   opac: 1  scale: 3
-        self.out_dim = 11
-        self.sigma_net = MLP(self.in_dim + self.audio_dim + self.eye_dim + self.individual_dim, self.out_dim, self.hidden_dim, self.num_layers)
-
-        self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 32, 2)
-
-        self.cache = None
-        '''
-        # 新论文的 MLP 配置
-        self.D = 8  # 层数
-        self.W = 256  # 隐藏层维度
-        self.skips = [self.D // 2]  # skip connection 在第 4 层
-        self.input_ch = self.xyz_input_ch + self.audio_dim + self.eye_dim + self.individual_dim  # 输入维度
-        self.out_dim = 11  # 输出维度
-
-        # 定义 MLP 层
-        self.deform_net = nn.ModuleList(
-            [nn.Linear(self.input_ch, self.W)] +  # 第一层
-            [nn.Linear(self.W, self.W) if i not in self.skips else nn.Linear(self.W + self.input_ch, self.W)
-             for i in range(self.D - 1)]  # 中间层
-        )
-        # 输出层
-        self.gaussian_warp = nn.Linear(self.W, 3)  # 位移
-        self.gaussian_rotation = nn.Linear(self.W, 4)  # 旋转
-        self.gaussian_opacity = nn.Linear(self.W, 1)  # 不透明度
-        self.gaussian_scaling = nn.Linear(self.W, 3)  # 缩放
-
-        # 音频通道注意力
-        # self.aud_ch_att_net = MLP(self.xyz_input_ch, self.audio_dim, 32, 2)
-        self.aud_ch_att_net = nn.ModuleList([
-            nn.Linear(self.xyz_input_ch, 32, bias=False),
-            nn.Linear(32, self.audio_dim, bias=False)
-        ])
-        '''
-        # 融合权重
-        self.eye_feature_fusion = nn.Sequential(
-            nn.Linear(self.xyz_input_ch * 2, self.xyz_input_ch),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.xyz_input_ch, self.xyz_input_ch),
-            nn.Sigmoid()  # 输出门控权重
-        )
-        '''
-
-    '''
-    @staticmethod
-    @torch.jit.script
-    def split_xyz(x):
-        xy, yz, xz = x[:, :-1], x[:, 1:], torch.cat([x[:,:1], x[:,-1:]], dim=-1)
-        return xy, yz, xz
-    '''
-
-    def encode_x(self, xyz):
-        '''
-        # x: [N, 3], in [-bound, bound]
-        N, M = xyz.shape
-        xy, yz, xz = self.split_xyz(xyz)
-        feat_xy = self.encoder_xy(xy, bound=bound)
-        feat_yz = self.encoder_yz(yz, bound=bound)
-        feat_xz = self.encoder_xz(xz, bound=bound)
-
-        return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
-        '''
-        return self.embed_fn(xyz)  # 使用频率编码
-
-    def encode_audio(self, a):
-        # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
-        # if emb, a should be: [1, 16] or [8, 16]
-
-        # fix audio traininig
-        if a is None: return None
-
-        enc_a = self.audio_net(a)  # [1/8, 64]
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0))  # [1, 64]
-
-        return enc_a
-
-    def forward(self, x, a, e=None, c=None):
-        # x: [N, 3], in [-bound, bound]
-        # enc_x = self.encode_x(x, bound=self.bound)
-        enc_x = self.encode_x(x)  # 位置编码（频率编码）
-
-        # 音频特征
-        enc_a = self.encode_audio(a)
-        enc_a = enc_a.repeat(enc_x.shape[0], 1)
-
-        # eye_region_mask = self.eye_region_detector(enc_x)
-        # enc_x_eye = enc_x + self.eye_region_bias * eye_region_mask
-        # eye_region_mask = torch.sigmoid(self.eye_region_detector(enc_x)) * 0.1  # 缩放因子限制影响
-        # enc_x_eye = enc_x + self.eye_region_bias * eye_region_mask
-        '''
-        # 融合原始特征和眼部增强特征
-        combined_features = torch.cat([enc_x, enc_x_eye], dim=-1)
-        fusion_weights = self.eye_feature_fusion(combined_features)
-
-        # 加权融合 - 在眼部区域更侧重增强特征
-        fused_enc_x = enc_x * (1 - fusion_weights) + enc_x_eye * fusion_weights
-        '''
-        # aud_ch_att = self.aud_ch_att_net(enc_x)
-        aud_ch_att = self.aud_ch_att_net[0](enc_x)
-        aud_ch_att = F.relu(aud_ch_att, inplace=True)  # 11
-        aud_ch_att = self.aud_ch_att_net[1](aud_ch_att)  # 1
-        enc_w = enc_a * aud_ch_att
-
-        # 眼睛特征
-        # eye_att = torch.relu(self.eye_att_net(enc_x))
-        # enc_e = self.exp_encode_net(e[:-1])
-
-        # eye_att = self.eye_att_net[0](enc_x)
-        # eye_att = F.relu(eye_att, inplace=True)
-        # eye_att = torch.relu(self.eye_att_net[1](eye_att))
-        eye_att = torch.relu(self.eye_att_net(enc_x))
-        # eye_att = self.eye_att_net[0](enc_x_eye)
-        # for i in range(1, len(self.eye_att_net)):
-        #    eye_att = self.eye_att_net[i](eye_att)
-
-        # enc_e = self.exp_encode_net[0](e[:-1])
-        # enc_e = F.relu(enc_e, inplace=True)
-        # enc_e = self.exp_encode_net[1](enc_e)
-        enc_e = self.exp_encode_net(e[:-1])
-        enc_e = torch.cat([enc_e, e[-1:]], dim=-1)
-        enc_e = enc_e * eye_att
-
-        # 合并输入
-        if c is not None:
-            c = c.repeat(enc_x.shape[0], 1)
-            h = torch.cat([enc_x, enc_w, enc_e, c], dim=-1)
-        else:
-            h = torch.cat([enc_x, enc_w, enc_e], dim=-1)
-
-        # MLP 前向传播（新论文的 8 层 MLP）
-        for i, l in enumerate(self.deform_net):
-            h = self.deform_net[i](h)
-            h = F.relu(h, inplace=True)
-            if i in self.skips:
-                h = torch.cat([h, enc_x, enc_w, enc_e], dim=-1) if c is None else torch.cat(
-                    [h, enc_x, enc_w, enc_e, c], dim=-1)
-        '''
-        for i, l in enumerate(self.deform_net):
-            if i in self.skips:
-                h = torch.cat([h, enc_x, enc_w, enc_e], dim=-1) if c is None else \
-                    torch.cat([h, enc_x, enc_w, enc_e, c], dim=-1)
-
-            h = self.deform_net[i](h)
-            if i != len(self.deform_net) - 1:  # 最后一层通常不激活
-                h = F.relu(h, inplace=True)
-        '''
-        # 输出
-        d_xyz = self.gaussian_warp(h) * 1e-2
-        d_rot = self.gaussian_rotation(h)
-        d_opa = self.gaussian_opacity(h)
-        d_scale = self.gaussian_scaling(h)
-        results = {
-            'd_xyz': d_xyz,
-            'd_rot': d_rot,
-            'd_opa': d_opa,
-            'd_scale': d_scale,
-            'ambient_aud': aud_ch_att.norm(dim=-1, keepdim=True),
-            'ambient_eye': eye_att.norm(dim=-1, keepdim=True),
-        }
-        '''
-        h = self.sigma_net(h)
-        d_xyz = h[..., :3] * 1e-2
-        d_rot = h[..., 3:7]
-        d_opa = h[..., 7:8]
-        d_scale = h[..., 8:11]
-        results = {
-            'd_xyz': d_xyz,
-            'd_rot': d_rot,
-            'd_opa': d_opa,
-            'd_scale': d_scale,
-            'ambient_aud': aud_ch_att.norm(dim=-1, keepdim=True),
-            'ambient_eye': eye_att.norm(dim=-1, keepdim=True),
-        }
-        '''
-        self.cache = results
-        return results
-
-    # optimizer utils
-    def get_params(self, lr, lr_net, wd=0):
-        '''
-        params = [
-            {'params': self.audio_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.encoder_xy.parameters(), 'lr': lr},
-            {'params': self.encoder_yz.parameters(), 'lr': lr},
-            {'params': self.encoder_xz.parameters(), 'lr': lr},
-            {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-        ]
-        '''
-        params = [
-            {'params': self.audio_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.deform_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.gaussian_warp.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.gaussian_rotation.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.gaussian_opacity.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.gaussian_scaling.parameters(), 'lr': lr_net, 'weight_decay': wd},
-        ]
-        params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
-        if self.individual_dim > 0:
-            params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
-
-        params.append({'params': self.aud_ch_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
-        params.append({'params': self.eye_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
-        params.append({'params': self.exp_encode_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
-        # params.append({'params': self.eye_region_bias, 'lr': lr_net * 0.05, 'weight_decay': 0})
-        # params.append({'params': self.eye_region_detector.parameters(), 'lr': lr_net * 0.1, 'weight_decay': wd})
-        # params.append({'params': self.eye_feature_fusion.parameters(), 'lr': lr_net * 0.05, 'weight_decay': wd})
-        return params
-
-
-class MouthMotionNetwork(nn.Module):
-    def __init__(self,
-                 audio_dim=32,
-                 ind_dim=0,
-                 args=None,
-                 # multires=10,  # 频率编码的频率数
-                 multires=15,  # 频率编码的频率数
-                 ):
-        super(MouthMotionNetwork, self).__init__()
-
-        if 'esperanto' in args.audio_extractor:
-            self.audio_in_dim = 44
-        elif 'deepspeech' in args.audio_extractor:
-            self.audio_in_dim = 29
-        elif 'hubert' in args.audio_extractor:
-            self.audio_in_dim = 1024
-        elif 'ave' in args.audio_extractor:
-            self.audio_in_dim = 32
-        else:
-            raise NotImplementedError
-
-        self.bound = 0.15
-
-        self.individual_dim = ind_dim
         if self.individual_dim > 0:
             self.individual_codes = nn.Parameter(torch.randn(10000, self.individual_dim) * 0.1)
-
-            # audio network
-        self.audio_dim = audio_dim
-        if args.audio_extractor == 'ave':
-            self.audio_net = AudioNet_ave(self.audio_in_dim, self.audio_dim)
-        else:
-            self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
-        self.audio_att_net = AudioAttNet(self.audio_dim)
-
-        # 位置编码（频率编码）
-        self.embed_fn, self.xyz_input_ch = get_embedder(multires, i=3)
-        self.num_layers = 3
-        self.hidden_dim = 32
-        self.out_dim = 7
-        self.move_dim = 3
-        self.sigma_net = MLP(self.xyz_input_ch + self.audio_dim + self.individual_dim + self.move_dim, self.out_dim,
-                             self.hidden_dim, self.num_layers)
-        self.scaler_net = MLP(self.xyz_input_ch + self.move_dim, 1, 16, 3)
-
-        # MLP 配置
-        self.D = 8  # 层数
-        self.W = 256  # 隐藏层维度
-        self.skips = [self.D // 2]  # skip connection 在第 4 层
-        self.input_ch = self.xyz_input_ch + self.audio_dim + self.individual_dim + self.move_dim  # 输入维度
-        self.out_dim = 3  # 输出维度（仅 d_xyz）
-
-        # 定义 MLP 层
-        self.deform_net = nn.ModuleList(
-            [nn.Linear(self.input_ch, self.W)] +  # 第一层
-            [nn.Linear(self.W, self.W) if i not in self.skips else nn.Linear(self.W + self.input_ch, self.W)
-             for i in range(self.D - 1)]  # 中间层
-        )
-        # 输出层
-        self.gaussian_warp = nn.Linear(self.W, 3)  # 位移
-        self.gaussian_rotation = nn.Linear(self.W, 4)  # 旋转
-
-        # 音频通道注意力
-        self.aud_ch_att_net = nn.ModuleList([
-            nn.Linear(self.xyz_input_ch, 32, bias=False),
-            nn.Linear(32, self.audio_dim, bias=False)
-        ])
-
-    def encode_x(self, xyz):
-        return self.embed_fn(xyz)  # 使用频率编码
-
-    def encode_audio(self, a):
-        # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
-        # if emb, a should be: [1, 16] or [8, 16]
-
-        # fix audio traininig
-        if a is None: return None
-
-        enc_a = self.audio_net(a)  # [1/8, 64]
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0))  # [1, 64]
-
-        return enc_a
-
-    def forward(self, x, a, move):
-        # x: [N, 3], in [-bound, bound]
-        # move: [1, D]
-        enc_x = self.encode_x(x)
-
-        # 计算音频相关特征
-        enc_a = self.encode_audio(a)
-        enc_a = enc_a.repeat(enc_x.shape[0], 1)
-        aud_ch_att = self.aud_ch_att_net[0](enc_x)
-        aud_ch_att = F.relu(aud_ch_att, inplace=True)
-        aud_ch_att = self.aud_ch_att_net[1](aud_ch_att)
-        enc_w = enc_a * aud_ch_att
-        move = move.repeat(enc_x.shape[0], 1)
-
-        # 安全合并输入
-        safe_concat = lambda *tensors: torch.cat([t for t in tensors if t is not None and t.numel() > 0], dim=-1)
-        h = safe_concat(enc_x, enc_w, move)
-
-        # 计算缩放因子
-        h_s = safe_concat(enc_x, move)
-        if hasattr(self, 'scaler_net') and callable(self.scaler_net):
-            h_s = self.scaler_net(h_s)
-
-        # 保存原始权重状态，用于EMA更新
-        original_shapes = {}
-        for i, layer in enumerate(self.deform_net):
-            if isinstance(layer, nn.Linear):
-                original_shapes[i] = (layer.weight.shape, layer.bias.shape if layer.bias is not None else None)
-
-        # MLP前向传播 - 添加维度验证和自动调整
-        adjusted_layers = []  # 记录调整过的层
-        for i, layer in enumerate(self.deform_net):
-            # 检查输入维度是否匹配
-            if hasattr(layer, 'in_features') and h.size(1) != layer.in_features:
-                # 自动调整权重以适应新的维度
-                with torch.no_grad():
-                    # 计算最小公共维度
-                    min_dim = min(h.size(1), layer.in_features)
-
-                    # 创建新的权重矩阵
-                    new_weight = torch.zeros(layer.out_features, h.size(1), device=h.device)
-
-                    # 复制原有权重到新矩阵的对应位置
-                    if min_dim > 0:
-                        new_weight[:, :min_dim] = layer.weight.data[:, :min_dim]
-
-                    # 创建新的偏置（如果存在）
-                    new_bias = torch.zeros(layer.out_features, device=h.device) if layer.bias is not None else None
-
-                    # 创建新层并替换
-                    new_layer = nn.Linear(h.size(1), layer.out_features)
-                    new_layer.weight.data = new_weight
-                    if new_bias is not None:
-                        new_layer.bias.data = new_bias
-
-                    # 替换原层
-                    self.deform_net[i] = new_layer.to(h.device)
-                    layer = new_layer
-                    adjusted_layers.append(i)
-
-                    # 输出调整信息
-                    print(f"调整层 {i}: {original_shapes.get(i, ())} -> {new_weight.shape}")
-
-            h = layer(h)
-            h = F.relu(h, inplace=True)
-
-            # 安全处理跳跃连接
-            if i in getattr(self, 'skips', []):
-                try:
-                    h = safe_concat(h, enc_x, enc_w, move)
-                except Exception as e:
-                    print(f"安全跳跃连接降级: {str(e)}")
-                    # 降级处理：只保留原始特征
-                    if layer.in_features > 0:
-                        h = h[:, :layer.in_features]
-
-        # EMA更新 - 确保参数尺寸一致
-        self.sync_ema(adjusted_layers)
-
-        # 输出处理
-        d_xyz = self.gaussian_warp(h) * 1e-2
-        d_xyz[..., 0] = d_xyz[..., 0] / 5
-        d_xyz[..., 2] = d_xyz[..., 2] / 5
-        d_rot = self.gaussian_rotation(h)
-
-        if hasattr(self, 'scaler_net') and callable(self.scaler_net):
-            scale_factor = torch.sigmoid(h_s) * 2
-            d_xyz *= scale_factor
-
-        return {
-            'd_xyz': d_xyz,
-            'd_rot': d_rot,
-        }
-
-    def sync_ema(self, adjusted_layers):
-        """同步EMA参数尺寸"""
-        if not hasattr(self, 'ema') or self.ema is None:
-            return
-
-        for i in adjusted_layers:
-            layer = self.deform_net[i]
-            with self.ema.shadow_params():
-                # 获取EMA中存储的参数
-                ema_param = getattr(self.ema.shadow, f'deform_net.{i}.weight')
-
-                # 获取当前尺寸
-                current_shape = layer.weight.shape
-                ema_shape = ema_param.shape
-
-                # 如果尺寸不匹配，调整EMA参数
-                if current_shape != ema_shape:
-                    print(f"调整EMA层 {i}: {ema_shape} -> {current_shape}")
-                    with torch.no_grad():
-                        # 创建新的EMA参数
-                        new_ema = torch.zeros_like(layer.weight)
-
-                        # 计算尺寸差异
-                        min_dim0 = min(current_shape[0], ema_shape[0])
-                        min_dim1 = min(current_shape[1], ema_shape[1])
-
-                        # 复制原EMA值到新矩阵
-                        new_ema[:min_dim0, :min_dim1] = ema_param[:min_dim0, :min_dim1]
-
-                        # 更新EMA
-                        setattr(self.ema.shadow, f'deform_net.{i}.weight', new_ema)
-
-                        # 处理偏置
-                        if hasattr(layer, 'bias') and layer.bias is not None:
-                            ema_bias = getattr(self.ema.shadow, f'deform_net.{i}.bias')
-                            new_ema_bias = torch.zeros_like(layer.bias)
-                            min_dim = min(len(layer.bias), len(ema_bias))
-                            new_ema_bias[:min_dim] = ema_bias[:min_dim]
-                            setattr(self.ema.shadow, f'deform_net.{i}.bias', new_ema_bias)
-
-    # optimizer utils
-    def get_params(self, lr, lr_net, wd=0):
-
-        params = [
-            {'params': self.audio_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.deform_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.gaussian_warp.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            # {'params': self.audio_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            # {'params': self.encoder_xy.parameters(), 'lr': lr},
-            # {'params': self.encoder_yz.parameters(), 'lr': lr},
-            # {'params': self.encoder_xz.parameters(), 'lr': lr},
-            # {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.scaler_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
-        ]
-        params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
-        if self.individual_dim > 0:
-            params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
-
-        params.append({'params': self.aud_ch_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
-
-        return params
-
-
-class PersonalizedMotionNetwork(nn.Module):
-    def __init__(self,
-                 audio_dim=32,
-                 ind_dim=0,
-                 args=None,
-                 multires=10,  # 频率编码的频率数
-                 ):
-        super(PersonalizedMotionNetwork, self).__init__()
-
-        if 'esperanto' in args.audio_extractor:
-            self.audio_in_dim = 44
-        elif 'deepspeech' in args.audio_extractor:
-            self.audio_in_dim = 29
-        elif 'hubert' in args.audio_extractor:
-            self.audio_in_dim = 1024
-        elif 'ave' in args.audio_extractor:
-            self.audio_in_dim = 32
-        else:
-            raise NotImplementedError
-
-        self.args = args
-        self.bound = 0.15
-        self.exp_eye = args.type == 'face'
-
-        self.individual_dim = ind_dim
-        if self.individual_dim > 0:
-            self.individual_codes = nn.Parameter(torch.randn(10000, self.individual_dim) * 0.1)
-
-            # audio network
-        self.audio_dim = audio_dim
-        if args.audio_extractor == 'ave':
-            self.audio_net = AudioNet_ave(self.audio_in_dim, self.audio_dim)
-        else:
-            self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
-        self.audio_att_net = AudioAttNet(self.audio_dim)
-
-        # DYNAMIC PART
-        self.num_levels = 12
-        self.level_dim = 1
-        self.encoder_xy, self.in_dim_xy = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
-                                                      level_dim=self.level_dim, base_resolution=16,
-                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
-        self.encoder_yz, self.in_dim_yz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
-                                                      level_dim=self.level_dim, base_resolution=16,
-                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
-        self.encoder_xz, self.in_dim_xz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
-                                                      level_dim=self.level_dim, base_resolution=16,
-                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
-
-        self.in_dim = self.in_dim_xy + self.in_dim_yz + self.in_dim_xz
-
-        self.num_layers = 3
-
-        self.hidden_dim = 32 if args.type == 'face' else 16
-        # 位置编码（频率编码）
-        # self.embed_fn, self.xyz_input_ch = get_embedder(multires, i=3)
-
-        self.exp_in_dim = 6 - 1
-        self.eye_dim = 6 if self.exp_eye else 0
-        if self.exp_eye:
-            self.exp_encode_net = MLP(self.exp_in_dim, self.eye_dim - 1, 16, 2)
-            self.eye_att_net = MLP(self.in_dim, self.eye_dim, 16, 2)
-            '''
-            self.exp_encode_net = nn.ModuleList([
-                nn.Linear(self.exp_in_dim, 16, bias=False),
-                nn.Linear(16, self.eye_dim - 1, bias=False)
-            ])
-            self.eye_att_net = nn.ModuleList([
-                nn.Linear(self.xyz_input_ch, 16, bias=False),
-                nn.Linear(16, self.eye_dim, bias=False)
-            ])
-            # 更深的网络结构
-
-            self.eye_att_net = nn.ModuleList([
-                nn.Linear(self.xyz_input_ch, 64, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Linear(64, 32, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Linear(32, self.eye_dim, bias=False),
-                nn.Sigmoid()  # 添加Sigmoid确保输出在0-1范围内
-            ])
-
-            # 更强大的网络
-            self.exp_encode_net = nn.Sequential(
-                nn.Linear(self.exp_in_dim, 32),
-                nn.ReLU(inplace=True),
-                nn.Linear(32, 64),
-                nn.ReLU(inplace=True),
-                nn.Linear(64, 32),
-                nn.ReLU(inplace=True),
-                nn.Linear(32, 5),  # 确保输出维度是5，因为后面要与e[-1:]拼接得到6维
-                nn.Tanh()
-            )
-
-            # 添加眼部区域的空间偏置
-            self.eye_region_bias = nn.Parameter(torch.zeros(1, self.xyz_input_ch))
-
-            # 添加眼部区域检测网络
-            # self.eye_region_detector = nn.Linear(self.xyz_input_ch, 1)
-            self.eye_region_detector = nn.Sequential(
-                nn.Linear(self.xyz_input_ch, 32),
-                nn.ReLU(inplace=True),
-                nn.Linear(32, 1),
-                nn.Sigmoid()
-            )
-            # 拼接权重
-            self.eye_feature_fusion = nn.Sequential(
-                nn.Linear(self.xyz_input_ch * 2, self.xyz_input_ch),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.xyz_input_ch, self.xyz_input_ch),
-                nn.Sigmoid()  # 输出门控权重
-            )
-            '''
-
-        # 新论文的 MLP 配置
-        self.D = 8  # 层数
-        self.W = 256  # 隐藏层维度
-        self.skips = [self.D // 2]  # skip connection 在第 4 层
-        # self.input_ch = self.xyz_input_ch + self.audio_dim + self.eye_dim + self.individual_dim  # 输入维度
-        self.input_ch = self.in_dim + self.audio_dim + self.eye_dim + self.individual_dim  # 输入维度
-        self.out_dim = 11 if args.type == 'face' else 7  # 输出维度
-
-        # 定义 MLP 层
-        self.deform_net = nn.ModuleList(
-            [nn.Linear(self.input_ch, self.W)] +  # 第一层
-            [nn.Linear(self.W, self.W) if i not in self.skips else nn.Linear(self.W + self.input_ch, self.W)
-             for i in range(self.D - 1)]  # 中间层
-        )
-        # 输出层
-        self.gaussian_warp = nn.Linear(self.W, 3)  # 位移
-        self.gaussian_rotation = nn.Linear(self.W, 4)  # 旋转
-        self.gaussian_opacity = nn.Linear(self.W, 1)  # 不透明度
-        self.gaussian_scaling = nn.Linear(self.W, 3)  # 缩放
-
-        # 音频通道注意力
-        # self.aud_ch_att_net = MLP(self.xyz_input_ch, self.audio_dim, 32, 2)
-        self.aud_ch_att_net = nn.ModuleList([
-            # nn.Linear(self.xyz_input_ch, 32, bias=False),
-            nn.Linear(self.in_dim, 32, bias=False),
-            nn.Linear(32, self.audio_dim, bias=False)
-        ])
-
-        # self.sigma_net = MLP(self.xyz_input_ch + self.audio_dim + self.eye_dim + self.individual_dim, self.out_dim,
-        self.sigma_net = MLP(self.in_dim + self.audio_dim + self.eye_dim + self.individual_dim, self.out_dim,
-                             self.hidden_dim, self.num_layers)
-        # self.align_net = MLP(self.xyz_input_ch, 6, self.hidden_dim, 2)
-        self.align_net = MLP(self.in_dim, 6, self.hidden_dim, 2)
 
     @staticmethod
     @torch.jit.script
@@ -924,332 +237,224 @@ class PersonalizedMotionNetwork(nn.Module):
         xy, yz, xz = x[:, :-1], x[:, 1:], torch.cat([x[:, :1], x[:, -1:]], dim=-1)
         return xy, yz, xz
 
-    def encode_x(self, xyz, bound):
-        # x: [N, 3], in [-bound, bound]
-        N, M = xyz.shape
-        xy, yz, xz = self.split_xyz(xyz)
-        feat_xy = self.encoder_xy(xy, bound=bound)
-        feat_yz = self.encoder_yz(yz, bound=bound)
-        feat_xz = self.encoder_xz(xz, bound=bound)
+    #def encode_x(self, xyz, bound):
+        # xyz: [N, 3]
+    #    xy, yz, xz = self.split_xyz(xyz)
+    #    feat_xy = self.encoder_xy(xy, bound=bound)
+    #    feat_yz = self.encoder_yz(yz, bound=bound)
+    #    feat_xz = self.encoder_xz(xz, bound=bound)
+    #    return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
 
-        return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
-        # return self.embed_fn(xyz)  # 使用频率编码
+    # 两个独立的编码函数
+    def encode_x_mouth(self, xyz, bound):
+        xy, yz, xz = self.split_xyz(xyz)
+        return torch.cat([
+            self.encoder_xy_mouth(xy, bound=bound),
+            self.encoder_yz_mouth(yz, bound=bound),
+            self.encoder_xz_mouth(xz, bound=bound)
+        ], dim=-1)
+
+    def encode_x_face(self, xyz, bound):
+        xy, yz, xz = self.split_xyz(xyz)
+        return torch.cat([
+            self.encoder_xy_face(xy, bound=bound),
+            self.encoder_yz_face(yz, bound=bound),
+            self.encoder_xz_face(xz, bound=bound)
+        ], dim=-1)
 
     def encode_audio(self, a):
-        # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
-        # if emb, a should be: [1, 16] or [8, 16]
-
-        # fix audio traininig
         if a is None: return None
-
-        enc_a = self.audio_net(a)  # [1/8, 64]
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0))  # [1, 64]
-
+        enc_a = self.audio_net(a)
+        enc_a = self.audio_att_net(enc_a.unsqueeze(0))
         return enc_a
 
-    def forward(self, x, a, e=None, c=None):
-        # x: [N, 3], in [-bound, bound]
-        # enc_x = self.encode_x(x, bound=self.bound)
-        enc_x = self.encode_x(x, bound=self.bound)  # 位置编码（频率编码）
+    def forward(self, x, a, e=None, c=None, mouth_weight=None, time_offset=None):
+        """
+        Args:
+            x: Canonical XYZ (Raw coordinates)
+            a: Audio Features
+            e: Expression Features
+            c: Individual Code
+            mouth_weight: [N, 1] Soft mask (1=Mouth, 0=Face)
+            time_offset: [N, 3] TimeFormer predicted offsets
+        """
 
+        # ==========================================
+        # 1. Prepare Coordinates for Experts
+        # ==========================================
+        x_mouth_in = x
+        x_face_in = x
+
+        if time_offset is not None:
+            if self.use_tf_mouth:
+                x_mouth_in = x + time_offset
+            if self.use_tf_face:
+                x_face_in = x + time_offset
+
+        # 2. Spatial Encoding
+        # Optimization: If both use the same coords (both True or both False), encode once
+
+        #if self.use_tf_mouth == self.use_tf_face:
+        #    enc_x_common = self.encode_x(x_mouth_in, bound=self.bound)
+        #    enc_x_mouth = enc_x_common
+        #    enc_x_face = enc_x_common
+        #else:
+        enc_x_mouth = self.encode_x_mouth(x_mouth_in, bound=self.bound)
+        enc_x_face = self.encode_x_face(x_face_in, bound=self.bound)
+
+        # Prepare Individual Code
+        if c is not None:
+            c = c.repeat(x.shape[0], 1)
+
+        # Mouth Branch
         enc_a = self.encode_audio(a)
-        enc_a = enc_a.repeat(enc_x.shape[0], 1)
+        enc_a_rep = enc_a.repeat(x.shape[0], 1)
 
-        '''
-        eye_region_mask = self.eye_region_detector(enc_x)
-        enc_x_eye = enc_x + self.eye_region_bias * eye_region_mask
-        # 融合原始特征和眼部增强特征
-        combined_features = torch.cat([enc_x, enc_x_eye], dim=-1)
-        fusion_weights = self.eye_feature_fusion(combined_features)
-
-        # 加权融合 - 在眼部区域更侧重增强特征
-        fused_enc_x = enc_x * (1 - fusion_weights) + enc_x_eye * fusion_weights
-        '''
-        # aud_ch_att = self.aud_ch_att_net(enc_x)
-        # aud_ch_att = self.aud_ch_att_net[0](enc_x)
-        aud_ch_att = self.aud_ch_att_net[0](enc_x)
-        aud_ch_att = F.relu(aud_ch_att, inplace=True)  # 1
-        aud_ch_att = self.aud_ch_att_net[1](aud_ch_att)  # 1
-        enc_w = enc_a * aud_ch_att
-        h = torch.cat([enc_x, enc_w], dim=-1)
-
-        # 初始化输入特征字典
-        input_features = {
-            'h': h,
-            'enc_x': enc_x,
-            'enc_w': enc_w
-        }
-        # 眼睛特征
-        if self.exp_eye:
-            eye_att = torch.relu(self.eye_att_net(enc_x))
-            # eye_att = self.eye_att_net[0](enc_x)
-            # eye_att = F.relu(eye_att, inplace=True)
-            # eye_att = torch.relu(self.eye_att_net[1](eye_att))
-            # eye_att = self.eye_att_net[0](enc_x)
-            # eye_att = self.eye_att_net[0](enc_x_eye)
-            # for i in range(1, len(self.eye_att_net)):
-            #    eye_att = self.eye_att_net[i](eye_att)
-
-            # enc_e = self.exp_encode_net[0](e[:-1])
-            # enc_e = F.relu(enc_e, inplace=True)
-            # enc_e = self.exp_encode_net[1](enc_e)
-            enc_e = self.exp_encode_net(e[:-1])
-
-            enc_e = torch.cat([enc_e, e[-1:]], dim=-1)
-            input_features['enc_e'] = enc_e * eye_att
-            enc_e = enc_e * eye_att
-            h = torch.cat([enc_x, enc_w, enc_e], dim=-1)
+        # Audio-Spatial Attention (Uses Mouth Coords)
+        aud_ch_att = self.aud_ch_att_net(enc_x_mouth)
+        enc_w = enc_a_rep * aud_ch_att
 
         if c is not None:
-            # 确保c有正确的形状
-            if c.dim() == 1:
-                c = c.unsqueeze(0)
-            input_features['c'] = c.repeat(enc_x.shape[0], 1)
-            h = torch.cat([h, c], dim=-1)
-
-        # MLP 前向传播（新论文的 8 层 MLP）
-        for i, l in enumerate(self.deform_net):
-            h = self.deform_net[i](h)
-            h = F.relu(h, inplace=True)
-            if i in self.skips:
-                # 安全的拼接：只使用存在的特征
-                to_concat = [h]
-                for key in ['enc_x', 'enc_w', 'enc_e', 'c']:
-                    if key in input_features:
-                        to_concat.append(input_features[key])
-                h = torch.cat(to_concat, dim=-1)
-
-                # h = torch.cat([h, enc_x, enc_w, enc_e], dim=-1) if c is None else torch.cat(
-                #    [h, enc_x, enc_w, enc_e, c], dim=-1)
-
-        # 输出
-        d_xyz = self.gaussian_warp(h) * 1e-2
-        d_rot = self.gaussian_rotation(h)
-
-        if self.args.type == "face":
-            d_opa = self.gaussian_opacity(h)
-            d_scale = self.gaussian_scaling(h)
+            h_mouth = torch.cat([enc_x_mouth, enc_w, c], dim=-1)
         else:
-            d_opa = d_scale = None
+            h_mouth = torch.cat([enc_x_mouth, enc_w], dim=-1)
 
-        p = self.align_net(enc_x)
-        p_xyz = p[..., :3] * 1e-2
-        p_scale = torch.tanh(p[..., 3:] / 5) * 0.25 + 1
+        #out_mouth = self.mouth_expert_mlp(h_mouth)
+        # [CRITICAL CHANGE] Mouth 只输出 3 维 (XYZ)
+        out_mouth = self.mouth_expert_mlp(h_mouth)  # [N, 3]
 
-        return {
-            'd_xyz': d_xyz,
-            'd_rot': d_rot,
-            'd_opa': d_opa,
-            'd_scale': d_scale,
-            # 'ambient_aud': aud_ch_att.norm(dim=-1, keepdim=True),
-            # 'ambient_eye': eye_att.norm(dim=-1, keepdim=True) if self.exp_eye else None,
-            'ambient_aud': aud_ch_att.norm(dim=-1, keepdim=True),
-            'ambient_eye': eye_att.norm(dim=-1, keepdim=True) if self.exp_eye else None,
-            'p_xyz': p_xyz,
-            'p_scale': p_scale,
-        }
-
-    # optimizer utils
-    def get_params(self, lr, lr_net, wd=0):
-
-        params = [
-            {'params': self.audio_net.parameters(), 'name': 'neural_audio_net', 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.encoder_xy.parameters(), 'name': 'neural_encoder_xy', 'lr': lr},
-            {'params': self.encoder_yz.parameters(), 'name': 'neural_encoder_xy', 'lr': lr},
-            {'params': self.encoder_xz.parameters(), 'name': 'neural_encoder_xy', 'lr': lr},
-            {'params': self.deform_net.parameters(), 'name': 'neural_deform_net', 'lr': lr_net, 'weight_decay': wd},
-            # {'params': self.sigma_net.parameters(), 'name': 'neural_sigma_net', 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.align_net.parameters(), 'name': 'neural_align_net', 'lr': lr_net / 2, 'weight_decay': wd},
-        ]
-        params.append({'params': self.audio_att_net.parameters(), 'name': 'neural_audio_att_net', 'lr': lr_net * 5,
-                       'weight_decay': 0.0001})
-        if self.individual_dim > 0:
-            params.append(
-                {'params': self.individual_codes, 'name': 'neural_individual_codes', 'lr': lr_net, 'weight_decay': wd})
-
-        params.append({'params': self.aud_ch_att_net.parameters(), 'name': 'neural_aud_ch_att_net', 'lr': lr_net,
-                       'weight_decay': wd})
-
-        if self.exp_eye:
-            params.append({'params': self.eye_att_net.parameters(), 'name': 'neural_eye_att_net', 'lr': lr_net,
-                           'weight_decay': wd})
-            params.append({'params': self.exp_encode_net.parameters(), 'name': 'neural_exp_encode_net', 'lr': lr_net,
-                           'weight_decay': wd})
-            # params.append({'params': self.eye_region_bias, 'name': 'neural_eye_region_bias', 'lr': lr_net * 0.05, 'weight_decay': 0})
-            # params.append({'params': self.eye_region_detector.parameters(), 'name': 'neural_eye_region_detector', 'lr': lr_net * 0.1, 'weight_decay': wd})
-            # params.append({'params': self.eye_feature_fusion.parameters(), 'name': 'neural_eye_feature_fusion' ,'lr': lr_net * 0.05, 'weight_decay': wd})
-        return params
-
-
-'''
-
-
-class PersonalizedMotionNetwork(nn.Module):
-    def __init__(self,
-                 audio_dim=32,
-                 ind_dim=0,
-                 args=None,
-                 ):
-        super(PersonalizedMotionNetwork, self).__init__()
-
-        if 'esperanto' in args.audio_extractor:
-            self.audio_in_dim = 44
-        elif 'deepspeech' in args.audio_extractor:
-            self.audio_in_dim = 29
-        elif 'hubert' in args.audio_extractor:
-            self.audio_in_dim = 1024
-        elif 'ave' in args.audio_extractor:
-            self.audio_in_dim = 32
-        else:
-            raise NotImplementedError
-
-        self.args = args
-        self.bound = 0.15
-        self.exp_eye = args.type == 'face'
-
-        self.individual_dim = ind_dim
-        if self.individual_dim > 0:
-            self.individual_codes = nn.Parameter(torch.randn(10000, self.individual_dim) * 0.1)
-
-            # audio network
-        self.audio_dim = audio_dim
-        if args.audio_extractor == 'ave':
-            self.audio_net = AudioNet_ave(self.audio_in_dim, self.audio_dim)
-        else:
-            self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
-        self.audio_att_net = AudioAttNet(self.audio_dim)
-
-        # DYNAMIC PART
-        self.num_levels = 12
-        self.level_dim = 1
-        self.encoder_xy, self.in_dim_xy = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
-                                                      level_dim=self.level_dim, base_resolution=16,
-                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
-        self.encoder_yz, self.in_dim_yz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
-                                                      level_dim=self.level_dim, base_resolution=16,
-                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
-        self.encoder_xz, self.in_dim_xz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels,
-                                                      level_dim=self.level_dim, base_resolution=16,
-                                                      log2_hashmap_size=17, desired_resolution=256 * self.bound)
-
-        self.in_dim = self.in_dim_xy + self.in_dim_yz + self.in_dim_xz
-
-        self.num_layers = 3
-        self.hidden_dim = 32 if args.type == 'face' else 16
-
-        self.exp_in_dim = 6 - 1
-        self.eye_dim = 6 if self.exp_eye else 0
-        if self.exp_eye:
-            self.exp_encode_net = MLP(self.exp_in_dim, self.eye_dim - 1, 16, 2)
-            self.eye_att_net = MLP(self.in_dim, self.eye_dim, 16, 2)
-
-        # rot: 4   xyz: 3   opac: 1  scale: 3
-        self.out_dim = 11 if args.type == 'face' else 7
-        self.sigma_net = MLP(self.in_dim + self.audio_dim + self.eye_dim + self.individual_dim, self.out_dim,
-                             self.hidden_dim, self.num_layers)
-
-        self.align_net = MLP(self.in_dim, 6, self.hidden_dim, 2)
-
-        self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 32, 2)
-
-    @staticmethod
-    @torch.jit.script
-    def split_xyz(x):
-        xy, yz, xz = x[:, :-1], x[:, 1:], torch.cat([x[:, :1], x[:, -1:]], dim=-1)
-        return xy, yz, xz
-
-    def encode_x(self, xyz, bound):
-        # x: [N, 3], in [-bound, bound]
-        N, M = xyz.shape
-        xy, yz, xz = self.split_xyz(xyz)
-        feat_xy = self.encoder_xy(xy, bound=bound)
-        feat_yz = self.encoder_yz(yz, bound=bound)
-        feat_xz = self.encoder_xz(xz, bound=bound)
-
-        return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
-
-    def encode_audio(self, a):
-        # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
-        # if emb, a should be: [1, 16] or [8, 16]
-
-        # fix audio traininig
-        if a is None: return None
-
-        enc_a = self.audio_net(a)  # [1/8, 64]
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0))  # [1, 64]
-
-        return enc_a
-
-    def forward(self, x, a, e=None, c=None):
-        # x: [N, 3], in [-bound, bound]
-        enc_x = self.encode_x(x, bound=self.bound)
-
-        enc_a = self.encode_audio(a)
-        enc_a = enc_a.repeat(enc_x.shape[0], 1)
-        aud_ch_att = self.aud_ch_att_net(enc_x)
-        enc_w = enc_a * aud_ch_att
-        h = torch.cat([enc_x, enc_w], dim=-1)
-
-        if self.exp_eye:
-            eye_att = torch.relu(self.eye_att_net(enc_x))
+        # 4. Expert B: Face Branch
+        if e is not None:
+            # Eye Attention (Uses Face Coords)
+            eye_att = torch.relu(self.eye_att_net(enc_x_face))
             enc_e = self.exp_encode_net(e[:-1])
             enc_e = torch.cat([enc_e, e[-1:]], dim=-1)
             enc_e = enc_e * eye_att
-            h = torch.cat([h, enc_e], dim=-1)
-        if c is not None:
-            c = c.repeat(enc_x.shape[0], 1)
-            h = torch.cat([h, c], dim=-1)
-
-        h = self.sigma_net(h)
-
-        d_xyz = h[..., :3] * 1e-2
-        d_rot = h[..., 3:7]
-        if self.args.type == "face":
-            d_opa = h[..., 7:8]
-            d_scale = h[..., 8:11]
         else:
-            d_opa = d_scale = None
+            enc_e = torch.zeros((x.shape[0], self.eye_dim), device=x.device)
+            eye_att = torch.zeros((x.shape[0], self.eye_dim), device=x.device)
 
-        p = self.align_net(enc_x)
-        p_xyz = p[..., :3] * 1e-2
-        p_scale = torch.tanh(p[..., 3:] / 5) * 0.25 + 1
+        # Build Face Input Features
+        face_feats = [enc_x_face, enc_e]
+
+        # Debugging: Allow Face to see Audio?
+        if self.face_sees_audio:
+            # Re-use audio feature calculated above (minor approximation but efficient)
+            face_feats.append(enc_w)
+
+        if c is not None:
+            face_feats.append(c)
+
+        h_face = torch.cat(face_feats, dim=-1)
+        out_face = self.face_expert_mlp(h_face)
+
+        # ==========================================
+        # 5. Output Processing & Safety Scaling
+        # ==========================================
+
+        # --- 处理 Face Expert 输出 ---
+        # Face Expert 负责所有属性，作为 Base
+        d_xyz_face = torch.tanh(out_face[..., :3]) * 1e-2
+        d_rot_face = torch.tanh(out_face[..., 3:7]) * 0.2
+        d_opa_face = out_face[..., 7:8]
+        d_scale_face = torch.tanh(out_face[..., 8:11]) * 0.5
+
+        # --- 处理 Mouth Expert 输出 ---
+        # 1. 基础缩放 (防止初始值过大)
+        d_xyz_mouth = torch.tanh(out_mouth)  * 1e-2
+
+        # 2. [关键] 轴向抑制 (Axis Suppression)
+        # 限制 X(左右) 和 Z(前后)，放开 Y(上下)
+        # 这是一个 Trick：在 tanh 之后再除以一个系数，强行把这两个轴的位移压得非常小
+        scale_vec = torch.tensor([0.2, 1.0, 0.2], device=x.device).unsqueeze(0)
+        d_xyz_mouth = d_xyz_mouth * scale_vec
+        '''
+        # ==========================================
+        # 5. MoE Fusion
+        # ==========================================
+        if mouth_weight is not None:
+            if mouth_weight.dim() == 1:
+                mouth_weight = mouth_weight.unsqueeze(1)
+            # === [手动权重重映射逻辑] ===
+            # 只要原始权重达到，就视为 100% 的嘴部区域
+            threshold = 0.4
+
+            # 线性放大权重：将 0~0.4 映射到 0~1.0
+            # 这比 Sigmoid 更线性，梯度更平缓，不会炸
+            gating_mask = torch.clamp(mouth_weight / threshold, min=0.0, max=1.0)
+
+            # 平滑混合 (Linear Interpolation)
+            final_out = gating_mask * out_mouth + (1.0 - gating_mask) * out_face
+        else:
+            # Fallback if no weight is provided (e.g. init phase)
+            final_out = out_mouth + out_face
+        '''
+        # ==========================================
+        # 6. MoE Fusion (Robust Version)
+        # ==========================================
+        if mouth_weight is not None:
+            if mouth_weight.dim() == 1:
+                mouth_weight = mouth_weight.unsqueeze(1)
+
+            threshold = 0.4
+            gating_mask = torch.clamp(mouth_weight / threshold, min=0.0, max=1.0)
+
+            # [XYZ 融合] 只有 XYZ 进行混合
+            final_d_xyz = gating_mask * d_xyz_mouth + (1.0 - gating_mask) * d_xyz_face
+
+            # [其他属性] 强制使用 Face Expert 的结果
+            # 因为 Mouth Expert 根本没有输出这些，且嘴部不应该独立旋转/缩放
+            final_d_rot = d_rot_face
+            final_d_scale = d_scale_face
+            final_d_opa = d_opa_face
+
+        else:
+            # Fallback (通常只在第一帧或debug)
+            final_d_xyz = d_xyz_mouth + d_xyz_face
+            final_d_rot = d_rot_face
+            final_d_scale = d_scale_face
+            final_d_opa = d_opa_face
+
+
 
         return {
-            'd_xyz': d_xyz,
-            'd_rot': d_rot,
-            'd_opa': d_opa,
-            'd_scale': d_scale,
+            'd_xyz': final_d_xyz,
+            'd_rot': final_d_rot,
+            'd_opa': final_d_opa,
+            'd_scale': final_d_scale,
+            # Return attention maps for visualization/loss
             'ambient_aud': aud_ch_att.norm(dim=-1, keepdim=True),
-            'ambient_eye': eye_att.norm(dim=-1, keepdim=True) if self.exp_eye else None,
-            'p_xyz': p_xyz,
-            'p_scale': p_scale,
+            'ambient_eye': eye_att.norm(dim=-1, keepdim=True),
         }
 
-    # optimizer utils
     def get_params(self, lr, lr_net, wd=0):
-
         params = [
-            {'params': self.audio_net.parameters(), 'name': 'neural_audio_net', 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.encoder_xy.parameters(), 'name': 'neural_encoder_xy', 'lr': lr},
-            {'params': self.encoder_yz.parameters(), 'name': 'neural_encoder_xy', 'lr': lr},
-            {'params': self.encoder_xz.parameters(), 'name': 'neural_encoder_xy', 'lr': lr},
-            {'params': self.sigma_net.parameters(), 'name': 'neural_sigma_net', 'lr': lr_net, 'weight_decay': wd},
-            {'params': self.align_net.parameters(), 'name': 'neural_align_net', 'lr': lr_net / 2, 'weight_decay': wd},
+            {'params': self.audio_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
+            #{'params': self.encoder_xy.parameters(), 'lr': lr},
+            #{'params': self.encoder_yz.parameters(), 'lr': lr},
+            #{'params': self.encoder_xz.parameters(), 'lr': lr},
+
+            # Mouth Encoders
+            {'params': self.encoder_xy_mouth.parameters(), 'lr': lr},
+            {'params': self.encoder_yz_mouth.parameters(), 'lr': lr},
+            {'params': self.encoder_xz_mouth.parameters(), 'lr': lr},
+
+            # Face Encoders
+            {'params': self.encoder_xy_face.parameters(), 'lr': lr},
+            {'params': self.encoder_yz_face.parameters(), 'lr': lr},
+            {'params': self.encoder_xz_face.parameters(), 'lr': lr},
+
+            # Experts
+            {'params': self.mouth_expert_mlp.parameters(), 'lr': lr_net, 'weight_decay': wd},
+            {'params': self.face_expert_mlp.parameters(), 'lr': lr_net, 'weight_decay': wd},
+
+            # Attention & Helper Nets
+            {'params': self.aud_ch_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
+            {'params': self.eye_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
+            {'params': self.exp_encode_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
         ]
-        params.append({'params': self.audio_att_net.parameters(), 'name': 'neural_audio_att_net', 'lr': lr_net * 5,
-                       'weight_decay': 0.0001})
+        params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
         if self.individual_dim > 0:
-            params.append(
-                {'params': self.individual_codes, 'name': 'neural_individual_codes', 'lr': lr_net, 'weight_decay': wd})
-
-        params.append({'params': self.aud_ch_att_net.parameters(), 'name': 'neural_aud_ch_att_net', 'lr': lr_net,
-                       'weight_decay': wd})
-
-        if self.exp_eye:
-            params.append({'params': self.eye_att_net.parameters(), 'name': 'neural_eye_att_net', 'lr': lr_net,
-                           'weight_decay': wd})
-            params.append({'params': self.exp_encode_net.parameters(), 'name': 'neural_exp_encode_net', 'lr': lr_net,
-                           'weight_decay': wd})
+            params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
 
         return params
-'''

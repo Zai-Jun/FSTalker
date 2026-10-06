@@ -14,11 +14,6 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 
-def normalize(input, mean=None, std=None):
-    input_mean = torch.mean(input, dim=1, keepdim=True) if mean is None else mean
-    input_std = torch.std(input, dim=1, keepdim=True) if std is None else std
-    return (input - input_mean) / (input_std + 1e-2*torch.std(input.reshape(-1)))
-
 def patchify(input, patch_size):
     patches = F.unfold(input, kernel_size=patch_size, stride=patch_size).permute(0,2,1).view(-1, 3, patch_size, patch_size)
     return patches
@@ -72,13 +67,15 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean(1).mean(1).mean(1)
 
 #new--------来着DNG
-
+def normalize(input, mean=None, std=None):
+    input_mean = torch.mean(input, dim=1, keepdim=True) if mean is None else mean
+    input_std = torch.std(input, dim=1, keepdim=True) if std is None else std
+    return (input - input_mean) / (input_std + 1e-2*torch.std(input.reshape(-1)))
 
 def patchify2(input, patch_size):
     patches = F.unfold(input, kernel_size=patch_size, stride=patch_size).permute(0, 2, 1).view(-1,
                                                                                                1 * patch_size * patch_size)
     return patches
-
 
 def margin_l2_loss(network_output, gt, margin, return_mask=False):
     mask = (network_output - gt).abs() > margin
@@ -86,7 +83,6 @@ def margin_l2_loss(network_output, gt, margin, return_mask=False):
         return ((network_output - gt)[mask] ** 2).mean()
     else:
         return ((network_output - gt)[mask] ** 2).mean(), mask
-
 
 def patch_norm_mse_loss(input, target, patch_size, margin, return_mask=False):
     # Ensure input and target are 4D tensors
@@ -103,7 +99,6 @@ def patch_norm_mse_loss(input, target, patch_size, margin, return_mask=False):
     target_patches = target_patches[:min_length]
 
     return margin_l2_loss(input_patches, target_patches, margin, return_mask)
-
 
 def patch_norm_mse_loss_global(input, target, patch_size, margin, return_mask=False):
     # Ensure input and target are 4D tensors
@@ -136,7 +131,6 @@ def patch_norm_mse_loss2(input, target, patch_size, margin, return_mask=False):
     target_patches = target_patches[:min_length]
 
     return margin_l2_loss(input_patches, target_patches, margin, return_mask)
-
 
 def patch_norm_mse_loss_global2(input, target, patch_size, margin, return_mask=False):
     # Ensure input and target are 4D tensors
@@ -181,54 +175,3 @@ def loss_depth_smoothness(depth, img):
            (weight_x.sum() + weight_y.sum())
 
     return loss
-
-# [在文件头部原有的 import 下方添加]
-import torch.nn as nn  # <--- 新增这行
-
-# [在文件最末尾添加你的 NormalLoss 类]
-class NormalLoss(nn.Module):
-    def __init__(self, angle_weight=0.5, eps=1e-6):
-        """
-        参数:
-            angle_weight: 角度损失权重 (建议 0.3~0.7)
-            eps: 避免除0错误的小常数
-        """
-        super(NormalLoss, self).__init__()
-        self.angle_weight = angle_weight
-        self.eps = eps
-
-    def forward(self, normal_out, normal_tgt):
-        """
-        输入:
-            normal_out: 模型渲染出的法线图 [0, 1] 区间
-            normal_tgt: 目标法线图 [0, 1] 区间
-        注意：该函数内部会将其转换回 [-1, 1] 进行计算
-        """
-        if normal_tgt.dim() == 3:
-            normal_tgt = normal_tgt.unsqueeze(0)
-        if normal_out.dim() == 3:
-            normal_out = normal_out.unsqueeze(0)
-
-        # [0,1] -> [-1,1] 映射
-        normal_out = normal_out * 2 - 1
-        normal_tgt = normal_tgt * 2 - 1
-
-        # 单位化
-        normal_out = F.normalize(normal_out, dim=1, eps=self.eps)
-        normal_tgt = F.normalize(normal_tgt, dim=1, eps=self.eps)
-
-        # 有效 mask（排除零向量区域）
-        mask_out = (normal_out.abs().sum(1, keepdim=True) > 1e-4).float()
-        mask_tgt = (normal_tgt.abs().sum(1, keepdim=True) > 1e-4).float()
-        mask = (mask_out * mask_tgt).detach()
-
-        # L1 差异项
-        l1_loss = torch.abs(normal_out - normal_tgt)
-
-        # 角度差项（Cosine Similarity）
-        cos_sim = torch.sum(normal_out * normal_tgt, dim=1, keepdim=True).clamp(-1.0, 1.0)
-        angle_loss = 1 - cos_sim
-
-        # 综合损失 (B, 3, H, W)
-        loss_map = (l1_loss + self.angle_weight * angle_loss) * mask
-        return loss_map

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/FS-Talker.iml" filepath="$PROJECT_DIR$/.idea/FS-Talker.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/TGS.iml" filepath="$PROJECT_DIR$/.idea/TGS.iml" />
     </modules>
   </component>
 </project>

@@ -19,9 +19,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
-from scene.neural_renderer import GridRenderer
-from scene.motion_net import PersonalizedMotionNetwork
+from utils.general_utils import strip_symmetric, build_scaling_rotation, quatProduct_batch
 
 class GaussianModel:
 
@@ -43,10 +41,9 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
-        self.max_sh_degree = args.sh_degree  
+        self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -60,10 +57,12 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.neural_renderer = None
-        self.neural_motion_grid = None
-        self.setup_functions()
+
+        # [新增] 初始化 mouth_weight，默认为空
         self._mouth_weight = torch.empty(0)
+        # [新增] 初始化 uv_coords，默认为空 [N, 2]
+        self._uv_coords = torch.empty(0)
+        self.setup_functions()
 
     def capture(self):
         return (
@@ -79,9 +78,11 @@ class GaussianModel:
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
+            # [新增] 保存 mouth_weight
+            self._mouth_weight,
+            # [新增] 保存 uv_coords
+            self._uv_coords,
             self.spatial_lr_scale,
-            self.neural_renderer.state_dict(),
-            self.neural_motion_grid.state_dict(),
         )
     
     def restore(self, model_args, training_args):
@@ -96,24 +97,24 @@ class GaussianModel:
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
-        opt_dict, 
-        self.spatial_lr_scale,
-        neural_renderer_state,
-        neural_motion_grid_state) = model_args
-        if neural_renderer_state is not None:
-            self.neural_renderer = GridRenderer()
-            self.neural_renderer.recover_from_ckpt(neural_renderer_state)
-            self.neural_renderer.cuda()
-        if neural_motion_grid_state is not None:
-            self.neural_motion_grid = PersonalizedMotionNetwork(args=self.args).cuda()
-            self.neural_motion_grid.load_state_dict(neural_motion_grid_state)
-            self.neural_motion_grid.cuda()
+        opt_dict,
+        self._mouth_weight,  # [新增] 读取 mouth_weight
+        self._uv_coords,     # [新增] 读取 uv_coords
+        self.spatial_lr_scale) = model_args
         if training_args is not None:
             self.training_setup(training_args)
             self.optimizer.load_state_dict(opt_dict)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
 
+    # [新增] 外部注册 mouth_weight 的函数
+    def register_mouth_weight(self, weights):
+        """
+        weights: [N, 1] tensor, range [0, 1]
+        """
+        assert weights.shape[0] == self.get_xyz.shape[0], "Weights size mismatch!"
+        self._mouth_weight = weights.detach().clone()
+        print(f"Successfully registered mouth weights. Mean: {self._mouth_weight.mean():.4f}")
 
     @property
     def get_scaling(self):
@@ -136,7 +137,17 @@ class GaussianModel:
     @property
     def get_identity(self):
         return self._identity
-    
+
+    # [新增] 获取 mouth_weight 的接口
+    @property
+    def get_mouth_weight(self):
+        return self._mouth_weight
+
+    # [新增] 获取 uv_coords 的接口
+    @property
+    def get_uv_coords(self):
+        return self._uv_coords
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
@@ -147,6 +158,52 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+    def update_xyz_rot_scale(self, points, rot_delta, scale_coeff):
+        self._xyz = points #位置直接替换
+        self._rotation = quatProduct_batch(self._rotation_base, rot_delta)
+        self._scaling = self._scaling_base * scale_coeff
+
+    def create_from_verts(self, points, uv_coords_init=None):
+        """
+        基于输入的三维表面点云（points），初始化高斯基元的全部可学习属性。
+        """
+        features = torch.zeros((points.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        dist2 = torch.clamp_min(distCUDA2(points), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        rots = torch.zeros((points.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.1 * torch.ones((points.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        # [核心修正 1] 强制对齐 TalkingGaussian 独有属性的维度
+        identities = torch.zeros((points.shape[0], 1), dtype=torch.float, device="cuda")
+        mouth_weights = torch.zeros((points.shape[0], 1), dtype=torch.float, device="cuda")
+
+        # [核心修正 2] 必须将其封装为 nn.Parameter 并赋予梯度，否则 training_setup 注册 xyz 时会崩溃
+        self._xyz = nn.Parameter(points.clone().requires_grad_(True))
+
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+
+        # [核心修正 3] 注册 _identity 优化参数
+        self._identity = nn.Parameter(identities.requires_grad_(True))
+
+        self._scaling_base = nn.Parameter(scales.requires_grad_(True))
+        self._scaling = self._scaling_base
+        self._rotation_base = nn.Parameter(rots.requires_grad_(True))
+        self._rotation = self._rotation_base
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+
+        # [核心修正 4] 赋值 _mouth_weight (此项在原有架构中为静态张量，无需 requires_grad)
+        self._mouth_weight = mouth_weights
+
+        # [新增] 赋值 uv_coords [N, 2]
+        if uv_coords_init is not None:
+            self._uv_coords = uv_coords_init.detach().clone()
+        else:
+            self._uv_coords = torch.zeros((points.shape[0], 2), device="cuda")
+
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
@@ -155,6 +212,11 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
+
+        # [新增] 初始化 mouth_weight 为全 0 (默认全是脸)
+        self._mouth_weight = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+        # [新增] 初始化 uv_coords
+        self._uv_coords = torch.zeros((fused_point_cloud.shape[0], 2), device="cuda")
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -174,13 +236,9 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+
+
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self._mouth_weight = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.neural_renderer = GridRenderer(
-                            bound=((self._xyz.max(0).values-self._xyz.min(0).values).max())/2 * 1.2,
-                            coord_center=self._xyz.mean(0)
-                        ).cuda()
-        self.neural_motion_grid = PersonalizedMotionNetwork(args=self.args).cuda()
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -196,8 +254,6 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
-        l += self.neural_renderer.get_params(lr=5e-3, lr_net=5e-4)
-        l += self.neural_motion_grid.get_params(lr=1e-3, lr_net=1e-4)
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -331,7 +387,6 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if 'neural' in group["name"]: continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -358,9 +413,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+
         # [新增] 同步剪枝 mouth_weight
-        if hasattr(self, '_mouth_weight') and self._mouth_weight.shape[0] == mask.shape[0]:
-            self._mouth_weight = self._mouth_weight[valid_points_mask]
+        self._mouth_weight = self._mouth_weight[valid_points_mask]
+        # [新增] 同步剪枝 uv_coords
+        self._uv_coords = self._uv_coords[valid_points_mask]
+
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
@@ -369,7 +428,6 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if 'neural' in group["name"]  or 'eye_region_bias' in group["name"] or 'eye_region_detector' in group["name"]: continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -389,7 +447,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_identity, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_identity, new_opacities, new_scaling, new_rotation, new_mouth_weight, new_uv_coords=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -406,6 +464,11 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        # [新增] 拼接 mouth_weight (不经过 optimizer，直接 concat)
+        self._mouth_weight = torch.cat((self._mouth_weight, new_mouth_weight), dim=0)
+        # [新增] 拼接 uv_coords
+        if new_uv_coords is not None:
+            self._uv_coords = torch.cat((self._uv_coords, new_uv_coords), dim=0)
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -431,8 +494,12 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_identity = self._identity[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        # [新增] 复制 mouth_weight (重复 N 次)
+        new_mouth_weight = self._mouth_weight[selected_pts_mask].repeat(N, 1)
+        # [新增] 复制 uv_coords (重复 N 次)
+        new_uv_coords = self._uv_coords[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_identity, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_identity, new_opacity, new_scaling, new_rotation, new_mouth_weight, new_uv_coords)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -450,8 +517,12 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        # [新增] 复制 mouth_weight
+        new_mouth_weight = self._mouth_weight[selected_pts_mask]
+        # [新增] 复制 uv_coords
+        new_uv_coords = self._uv_coords[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_identity, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_identity, new_opacities, new_scaling, new_rotation, new_mouth_weight, new_uv_coords)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -468,51 +539,7 @@ class GaussianModel:
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
-    #def add_densification_stats(self, viewspace_point_tensor, update_filter):
-    #    self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-    #    self.denom[update_filter] += 1
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, pixels):
-
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True) * pixels[update_filter]
-        self.denom[update_filter] += pixels[update_filter]
-
-    # [新增] 暴露接口给外部读取
-    @property
-    def get_mouth_weight(self):
-        # [Lazy Fix] 动态维度同步
-        # 如果存储的权重数量与当前xyz数量不一致（发生了剪枝或加密）
-        if self._mouth_weight.shape[0] != self.get_xyz.shape[0]:
-            # 直接重置为全0 (或者全0.5)
-            # 这很安全，因为 update_mouth_weight 会在下一次训练迭代中
-            # 利用 2D Mask 重新把正确的权重填回去
-            current_len = self.get_xyz.shape[0]
-            device = self.get_xyz.device
-            self._mouth_weight = torch.zeros((current_len, 1), device=device)
-
-        return self._mouth_weight
-
-    # [新增] 暴露接口给训练脚本更新
-    def update_mouth_weight(self, new_weights, indices):
-        # 1. 获取当前高斯点的实际数量
-        current_num_points = self.get_xyz.shape[0]
-        # 获取我们存储的权重数量
-        stored_num_points = self._mouth_weight.shape[0]
-
-        # 2. 检查是否发生数量不一致 (Pruning/Densification)
-        if current_num_points != stored_num_points:
-            # 如果点数变了，说明原来的权重已经无法对应现在的点了 (索引乱了)
-            # 我们直接根据当前点数重新初始化全 0 权重
-            # 这不会影响训练，因为 Mask 会在当前帧立刻把嘴部区域更新回来
-            self._mouth_weight = torch.zeros((current_num_points, 1), device=self.get_xyz.device)
-
-        # 3. EMA 更新
-        # 此时 self._mouth_weight 的长度一定等于 current_num_points
-        # indices 是基于当前点数的 boolean mask，所以可以安全索引
-        old_weight = self._mouth_weight[indices]
-
-        # 形状对齐: new_weights 可能需要 view 一下以防万一
-        if new_weights.dim() == 1:
-            new_weights = new_weights.unsqueeze(1)
-
-        self._mouth_weight[indices] = 0.7 * old_weight + 0.3 * new_weights
+    def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        self.denom[update_filter] += 1

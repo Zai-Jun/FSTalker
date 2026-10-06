@@ -21,12 +21,10 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from tqdm import tqdm
 import pandas as pd
-import glob
 
 from utils.sh_utils import SH2RGB
 from utils.audio_utils import get_audio_features
 from scene.gaussian_model import BasicPointCloud
-
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -42,14 +40,12 @@ class CameraInfo(NamedTuple):
     background: np.array
     talking_dict: dict
 
-
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
-
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -74,7 +70,6 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
@@ -83,13 +78,12 @@ def fetchPly(path):
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
-
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
-             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
-
+            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+    
     normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
@@ -101,118 +95,34 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='',
-                              audio_extractor='deepspeech', N_views=-1, preload=True, ave_mouth=True):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=False):
     cam_infos = []
-    postfix_dict = {"deepspeech": "", "esperanto": "_eo", "hubert": "_hu"}
-
-    N_views = N_views if "train" in transformsfile and audio_file == '' else -1
+    postfix_dict = {"deepspeech": "ds", "esperanto": "eo", "hubert": "hu"}
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
         focal_len = contents["focal_len"]
+        bg_img = np.array(Image.open(os.path.join(path, 'bc.jpg')).convert("RGB"))
 
-        frames = contents["frames"][:N_views]
-
-        if audio_extractor == "ave":
-            from torch.utils.data import DataLoader
-            from scene.motion_net import AudioEncoder
-            from utils.audio_utils import AudDataset
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            model = AudioEncoder().to(device).eval()
-            ckpt = torch.load('./data_utils/audio_visual_encoder.pth')
-            model.load_state_dict({f'audio_encoder.{k}': v for k, v in ckpt.items()})
-            read_cache = False
-            if audio_file == '':
-                if os.path.exists(os.path.join(path, 'aud_ave.npy')):
-                    aud_features = np.load(os.path.join(path, 'aud_ave.npy'))
-                    print(aud_features.shape)
-                    read_cache = True
-                else:
-                    dataset = AudDataset(os.path.join(path, 'aud.wav'))
-            else:
-                dataset = AudDataset(audio_file)
-            if not read_cache:
-                data_loader = DataLoader(dataset, batch_size=128, shuffle=False)
-                outputs = []
-                for mel in tqdm(data_loader):
-                    mel = mel.to(device)
-                    with torch.no_grad():
-                        out = model(mel)
-                    outputs.append(out)
-                outputs = torch.cat(outputs, dim=0).cpu()
-                first_frame, last_frame = outputs[:1], outputs[-1:]
-                aud_features = torch.cat([first_frame.repeat(2, 1), outputs, last_frame.repeat(2, 1)],
-                                         dim=0).unsqueeze(0).permute(1, 2, 0).numpy()
-                if audio_file == '':
-                    np.save(os.path.join(path, 'aud_ave.npy'), aud_features)
-            # aud_features = np.load(os.path.join(self.root_path, 'aud_ave.npy'))
-        elif audio_file == '':
-            aud_features = np.load(os.path.join(path, 'aud{}.npy'.format(postfix_dict[audio_extractor])))
+        frames = contents["frames"]
+        
+        if audio_file == '':
+            aud_features = np.load(os.path.join(path, 'aud_{}.npy'.format(postfix_dict[audio_extractor])))
         else:
             aud_features = np.load(audio_file)
         aud_features = torch.from_numpy(aud_features)
         aud_features = aud_features.float().permute(0, 2, 1)
         auds = aud_features
 
-        if ave_mouth == True:
-            from torch.utils.data import DataLoader
-            from scene.motion_net import AudioEncoder
-            from utils.audio_utils import AudDataset
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            model = AudioEncoder().to(device).eval()
-            ckpt = torch.load('./data_utils/audio_visual_encoder.pth')
-            model.load_state_dict({f'audio_encoder.{k}': v for k, v in ckpt.items()})
-            read_cache = False
-            if audio_file == '':
-                if os.path.exists(os.path.join(path, 'aud_ave.npy')):
-                    m_aud_features = np.load(os.path.join(path, 'aud_ave.npy'))
-                    print(m_aud_features.shape)
-                    read_cache = True
-                else:
-                    dataset = AudDataset(os.path.join(path, 'aud.wav'))
-            else:
-                # [修改] 同上，针对Mouth Encoder也做同样的替换
-                if audio_file.endswith('.npy'):
-                    wav_file = audio_file.replace('.npy', '.wav')
-                    print(f"[Info] Input is .npy, switching to .wav for AVE Mouth extraction: {wav_file}")
-                    dataset = AudDataset(wav_file)
-                else:
-                    dataset = AudDataset(audio_file)
-            if not read_cache:
-                data_loader = DataLoader(dataset, batch_size=128, shuffle=False)
-                outputs = []
-                for mel in tqdm(data_loader):
-                    mel = mel.to(device)
-                    with torch.no_grad():
-                        out = model(mel)
-                    outputs.append(out)
-                outputs = torch.cat(outputs, dim=0).cpu()
-                first_frame, last_frame = outputs[:1], outputs[-1:]
-                m_aud_features = torch.cat([first_frame.repeat(2, 1), outputs, last_frame.repeat(2, 1)],
-                                         dim=0).unsqueeze(0).permute(1, 2, 0).numpy()
-                if audio_file == '':
-                    np.save(os.path.join(path, 'aud_ave.npy'), m_aud_features)
-            m_aud_features = torch.from_numpy(m_aud_features)
-            m_aud_features = m_aud_features.float().permute(0, 2, 1)
-            m_auds = m_aud_features
-
-        # loop
-        if audio_file != '':
-            loop_time = auds.shape[0] // len(frames) + 1
-            frames *= loop_time
-
-        au_info = pd.read_csv(os.path.join(path, 'au.csv'))
+        au_info=pd.read_csv(os.path.join(path, 'au.csv'))
         au_blink = au_info[' AU45_r'].values
         au25 = au_info[' AU25_r'].values
-        au25 = np.clip(au25[:N_views], 0, np.percentile(au25[:N_views], 95))
+        au25 = np.clip(au25, 0, np.percentile(au25, 95))
 
-        au25_25, au25_50, au25_75, au25_100 = np.percentile(au25, 25), np.percentile(au25, 50), np.percentile(au25,
-                                                                                                              75), au25.max()
+        au25_25, au25_50, au25_75, au25_100 = np.percentile(au25, 25), np.percentile(au25, 50), np.percentile(au25, 75), au25.max()
 
         au_exp = []
-        for i in [1, 4, 5, 6, 7, 45]:
+        for i in [1,4,5,6,7,45]:
             _key = ' AU' + str(i).zfill(2) + '_r'
             au_exp_t = au_info[_key].values
             if i == 45:
@@ -223,9 +133,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         ldmks_lips = []
         ldmks_mouth = []
         ldmks_lhalf = []
-
+        
         for idx, frame in tqdm(enumerate(frames)):
-            lms = np.loadtxt(os.path.join(path, 'ori_imgs', str(frame['img_id']) + '.lms'))  # [68, 2]
+            lms = np.loadtxt(os.path.join(path, 'ori_imgs', str(frame['img_id']) + '.lms')) # [68, 2]
             lips = slice(48, 60)
             mouth = slice(60, 68)
             xmin, xmax = int(lms[lips, 1].min()), int(lms[lips, 1].max())
@@ -234,17 +144,22 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             ldmks_lips.append([int(xmin), int(xmax), int(ymin), int(ymax)])
             ldmks_mouth.append([int(lms[mouth, 1].min()), int(lms[mouth, 1].max())])
 
-            lh_xmin, lh_xmax = int(lms[31:36, 1].min()), int(lms[:, 1].max())  # actually lower half area
+            lh_xmin, lh_xmax = int(lms[31:36, 1].min()), int(lms[:, 1].max()) # actually lower half area
             xmin, xmax = int(lms[:, 1].min()), int(lms[:, 1].max())
             ymin, ymax = int(lms[:, 0].min()), int(lms[:, 0].max())
             # self.face_rect.append([xmin, xmax, ymin, ymax])
             ldmks_lhalf.append([lh_xmin, lh_xmax, ymin, ymax])
-
+            
         ldmks_lips = np.array(ldmks_lips)
         ldmks_mouth = np.array(ldmks_mouth)
         ldmks_lhalf = np.array(ldmks_lhalf)
         mouth_lb = (ldmks_mouth[:, 1] - ldmks_mouth[:, 0]).min()
         mouth_ub = (ldmks_mouth[:, 1] - ldmks_mouth[:, 0]).max()
+
+        flame_param_dir = os.path.join(path, 'flame_param')
+        has_flame_dir = os.path.isdir(flame_param_dir)
+
+
 
         for idx, frame in tqdm(enumerate(frames)):
             cam_name = os.path.join(path, 'gt_imgs', str(frame["img_id"]) + extension)
@@ -256,63 +171,61 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             # get the world-to-camera transform and set R, T
             w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
+            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
+
+            image_path = os.path.join(path, cam_name)
+            image_name = Path(cam_name).stem
+            image = Image.open(image_path)
+            w, h = image.size[0], image.size[1]
+            if preload:
+                image = np.array(image.convert("RGB"))
+            else:
+                image = None
+
+            torso_img_path = os.path.join(path, 'torso_imgs', str(frame['img_id']) + '.png')
+            if preload:
+                torso_img = np.array(Image.open(torso_img_path).convert("RGBA")) * 1.0
+                bg = torso_img[..., :3] * torso_img[..., 3:] / 255.0 + bg_img * (1 - torso_img[..., 3:] / 255.0)
+                bg = bg.astype(np.uint8)
+            else:
+                bg = None
+            # bg = Image.fromarray(np.array(bg, dtype=np.byte), "RGB")
+            # bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
 
             talking_dict = {}
             talking_dict['img_id'] = frame['img_id']
 
-            image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
-            talking_dict['image_path'] = image_path
-            if preload or idx == 0:
-                image = Image.open(image_path)
-                w, h = image.size[0], image.size[1]
-                image = np.array(image.convert("RGB"))
-
-            torso_img_path = os.path.join(path, 'torso_imgs', str(frame['img_id']) + '.png')
-            bg_img_path = os.path.join(path, 'bc.jpg')
-            talking_dict['torso_img_path'] = torso_img_path
-            talking_dict['bg_img_path'] = bg_img_path
             if preload:
-                torso_img = np.array(Image.open(torso_img_path).convert("RGBA")) * 1.0
-                bg_img = np.array(Image.open(bg_img_path).convert("RGB"))
-                bg = torso_img[..., :3] * torso_img[..., 3:] / 255.0 + bg_img * (1 - torso_img[..., 3:] / 255.0)
-                bg = bg.astype(np.uint8)
-
-            if not preload:
-                image = bg = None
-
-            teeth_mask_path = os.path.join(path, 'teeth_mask', str(frame['img_id']) + '.npy')
-            mask_path = os.path.join(path, 'parsing', str(frame['img_id']) + '.png')
-            talking_dict['teeth_mask_path'] = teeth_mask_path
-            talking_dict['mask_path'] = mask_path
-            if preload:
+                teeth_mask_path = os.path.join(path, 'teeth_mask', str(frame['img_id']) + '.npy')
                 teeth_mask = np.load(teeth_mask_path)
+
+                mask_path = os.path.join(path, 'parsing', str(frame['img_id']) + '.png')
                 mask = np.array(Image.open(mask_path).convert("RGB")) * 1.0
-                talking_dict['face_mask'] = (mask[:, :, 2] > 254) * (mask[:, :, 0] == 0) * (
-                            mask[:, :, 1] == 0) ^ teeth_mask
+                talking_dict['face_mask'] = (mask[:, :, 2] > 254) * (mask[:, :, 0] == 0) * (mask[:, :, 1] == 0) ^ teeth_mask
                 talking_dict['hair_mask'] = (mask[:, :, 0] < 1) * (mask[:, :, 1] < 1) * (mask[:, :, 2] < 1)
-                talking_dict['mouth_mask'] = (mask[:, :, 0] == 100) * (mask[:, :, 1] == 100) * (
-                            mask[:, :, 2] == 100) + teeth_mask
+                talking_dict['mouth_mask'] = (mask[:, :, 0] == 100) * (mask[:, :, 1] == 100) * (mask[:, :, 2] == 100) + teeth_mask
 
 
+
+
+            
             if audio_file == '':
                 talking_dict['auds'] = get_audio_features(auds, 2, frame['img_id'])
-                talking_dict['m_auds'] = get_audio_features(m_auds, 2, frame['img_id'])
-                if frame['img_id'] > auds.shape[0] or frame['img_id'] > m_auds.shape[0]:
+                if frame['img_id'] > auds.shape[0]:
                     print("[warnining] audio feature is too short")
                     break
             else:
                 talking_dict['auds'] = get_audio_features(auds, 2, idx)
-                talking_dict['m_auds'] = get_audio_features(m_auds, 2, idx)
-                if idx >= auds.shape[0] and idx >= m_auds.shape[0]:
+                if idx >= auds.shape[0]:
                     break
+
 
             talking_dict['blink'] = torch.as_tensor(np.clip(au_blink[frame['img_id']], 0, 2) / 2)
             talking_dict['au25'] = [au25[frame['img_id']], au25_25, au25_50, au25_75, au25_100]
 
             talking_dict['au_exp'] = torch.as_tensor(au_exp[frame['img_id']])
+
 
             [xmin, xmax, ymin, ymax] = ldmks_lips[idx].tolist()
             # padding to H == W
@@ -330,70 +243,76 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             talking_dict['mouth_bound'] = [mouth_lb, mouth_ub, ldmks_mouth[idx, 1] - ldmks_mouth[idx, 0]]
             talking_dict['img_id'] = frame['img_id']
 
-            if "train" in transformsfile and N_views > 0:
-                normal_path_candidates = glob.glob(os.path.join(path, 'sapiens/normal/sapiens_*'))
-                normal_path_candidates.sort(reverse=True)
-                normal_path = os.path.join(normal_path_candidates[0], str(frame['img_id']) + '.npy')
-                talking_dict['normal_path'] = normal_path
+            # ==========================================================
+            # [核心补丁] 重新加载该帧的 2D 关键点，并存入 talking_dict 字典
+            # 这为后续的动态视锥体补偿 (Viewport Compensation) 提供绝对的视觉锚点
+            # ==========================================================
+            frame_lms = np.loadtxt(os.path.join(path, 'ori_imgs', str(frame['img_id']) + '.lms'))
+            talking_dict['lmks'] = torch.as_tensor(frame_lms, dtype=torch.float32)
+            # ==========================================================
 
-                depth_path_candidates = glob.glob(os.path.join(path, 'sapiens/depth/sapiens_*'))
-                depth_path_candidates.sort(reverse=True)
-                depth_path = os.path.join(depth_path_candidates[0], str(frame['img_id']) + '.npy')
-                talking_dict['depth_path'] = depth_path
-                if preload:
-                    normal = np.load(normal_path)
-                    talking_dict['normal'] = torch.as_tensor(normal).permute(2, 0, 1)
-                    depth = np.load(depth_path)
-                    talking_dict['depth'] = torch.as_tensor(depth)
+            # ==========================================================
+            # [DualBranchUNet] 加载 FLAME 参数（优先级：flame_param/{img_id}.npz > frame字段 > 无）
+            # ==========================================================
+            npz_path = None
+            if has_flame_dir:
+                npz_path = os.path.join(flame_param_dir, f"{int(frame['img_id']):05d}.npz")
+                if not os.path.exists(npz_path):
+                    npz_path = None
+            if npz_path is None and 'flame_param_path' in frame:
+                npz_path = os.path.join(path, frame['flame_param_path'])
+            if npz_path is not None and os.path.exists(npz_path):
+                flame_npz = dict(np.load(npz_path, allow_pickle=True))
+                for key in ['shape', 'expr', 'rotation', 'neck_pose', 'jaw_pose', 'eyes_pose', 'translation']:
+                    if key in flame_npz:
+                        talking_dict[key] = torch.as_tensor(flame_npz[key], dtype=torch.float32)
+            # ==========================================================
+
+
+
+            # norm_data = im_data / 255.0
+            # arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+            # image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
             FovX = focal2fov(focal_len, w)
             FovY = focal2fov(focal_len, h)
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                        image_path=image_path, image_name=image_name, width=w, height=h, background=bg,
-                                        talking_dict=talking_dict))
+                            image_path=image_path, image_name=image_name, width=w, height=h, background=bg, talking_dict=talking_dict))
 
+            # if idx > 200: break
             # if idx > 6500: break
-
+            
     return cam_infos
 
-
-def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", args=None, preload=True, all_for_train=False):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", args=None):
     audio_file = args.audio
     audio_extractor = args.audio_extractor
     if not eval:
         print("Reading Training Transforms")
-        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension,
-                                                    audio_file, audio_extractor, args.N_views, preload=preload)
+        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, audio_file, audio_extractor)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_val.json", white_background, extension, audio_file,
-                                               audio_extractor, args.N_views, preload=preload)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_val.json", white_background, extension, audio_file, audio_extractor)
+    
+    # if not eval:
+    #     train_cam_infos.extend(test_cam_infos)
+    #     test_cam_infos = []
+    if eval:
+        train_cam_infos = test_cam_infos
 
-    if all_for_train:
-        train_cam_infos.extend(test_cam_infos)
-        # test_cam_infos = []
+    nerf_normalization = getNerfppNorm(train_cam_infos) 
 
-    if eval: train_cam_infos = test_cam_infos  # for getNerfppNorm
-
-    nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "points3d.ply")
-    mesh_path = os.path.join(path, "track_params.pt")
     if not os.path.exists(ply_path) or True:
         # Since this data set has no colmap data, we start with random points
         num_pts = args.init_num
         print(f"Generating random point cloud ({num_pts})...")
-
+        
         # We create random points inside the bounds of the synthetic Blender scenes
         xyz = np.random.random((num_pts, 3)) * 0.2 - 0.1
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
-
-        # facial_mesh = torch.load(mesh_path)["vertices"]
-        # average_facial_mesh = torch.mean(facial_mesh, dim=0)
-        # xyz = average_facial_mesh.cpu().numpy() * 0.1
-        # shs = np.random.random((xyz.shape[0], 3)) / 255.0
-        # pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((xyz.shape[0], 3)))        
 
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
@@ -408,8 +327,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", args=N
                            ply_path=ply_path)
     return scene_info
 
-
 sceneLoadTypeCallbacks = {
     "Colmap": None,
-    "Blender": readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo
 }

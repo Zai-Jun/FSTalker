@@ -56,11 +56,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.audio = ""
         self.init_num = 10_000
-        self.N_views = -1
         self.audio_extractor = "deepspeech"
-        self.type = "face" # ["mouth", "face"]
-        self.preload = True
-        self.all_for_train = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -89,6 +85,8 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.005
         self.lambda_dssim = 0.2
+        self.lambda_offset_scale = 0.01
+        self.lambda_offset_color = 0.01
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

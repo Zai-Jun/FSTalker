@@ -8,7 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import torch
 import gc
 import os
 import random
@@ -16,7 +16,7 @@ import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
-from scene.motion_net import MotionNetwork, MouthMotionNetwork
+from scene.motion_net import MotionNetwork
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
@@ -42,9 +42,12 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        if os.path.exists(os.path.join(args.source_path, "canonical_flame_param.npz")):
+            print("Found canonical_flame_param.npz, assuming Dynamic NeRF data set!")
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args=args)
+        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args=args, preload=args.preload, all_for_train=args.all_for_train)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args=args)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -94,4 +97,3 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
-    

@@ -1,4 +1,4 @@
-name: instag
+name: talking_gaussian
 channels:
   - pytorch
   - conda-forge
@@ -6,7 +6,7 @@ channels:
 dependencies:
   - cudatoolkit=11.3
   - plyfile=0.8.1
-  - python=3.9
+  - python=3.7.13
   - pip=22.3.1
   - pytorch=1.12.1
   - torchaudio=0.12.1
@@ -14,13 +14,12 @@ dependencies:
   - tqdm
   - ffmpeg
   - openh264
-  - mkl=2024.0
   - pip:
     - ./submodules/diff-gaussian-rasterization
-    - ./submodules/simple-knn
+    - ./submodules/diff-gaussian-rasterization
     - ./gridencoder
-    - numpy==1.24.3
-    - pillow==9.5.0
+    - numpy
+    - pillow
     - scipy
     - tensorboard
     - opencv-python
@@ -29,6 +28,7 @@ dependencies:
     - pandas
     - tqdm
     - matplotlib
+    - PyMCubes==0.1.4
     - rich
     - packaging
     - scikit-learn
@@ -43,4 +43,3 @@ dependencies:
 
     - lpips
     - imageio-ffmpeg
-    - librosa

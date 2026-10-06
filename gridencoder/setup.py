@@ -1,7 +1,6 @@
 import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-import torch
 
 _src_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,10 +29,6 @@ elif os.name == "nt":
             raise RuntimeError("Could not locate a supported Microsoft Visual C++ installation")
         os.environ["PATH"] += ";" + cl_path
 
-if torch.__version__.startswith("2"):
-    nvcc_flags[1] = '-std=c++17'
-    c_flags[1] = '-std=c++17'
-
 setup(
     name='gridencoder', # package name, import this to use python API
     ext_modules=[
@@ -50,6 +45,6 @@ setup(
         ),
     ],
     cmdclass={
-        'build_ext': BuildExtension.with_options(use_ninja=False),
+        'build_ext': BuildExtension,
     }
 )

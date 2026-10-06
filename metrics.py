@@ -1,12 +1,10 @@
-import os
-
 import cv2
 import sys
 import lpips
 import numpy as np
 from matplotlib import pyplot as plt
 import torch
-from utils.loss_utils import ssim
+
 class LMDMeter:
     def __init__(self, backend='dlib', region='mouth'):
         self.backend = backend
@@ -178,93 +176,8 @@ class LPIPSMeter:
         return f'LPIPS ({self.net}) = {self.measure():.6f}'
 
 
-class SSIMMeter:
-    def __init__(self, window_size=11):
-        self.V = 0
-        self.N = 0
-        self.window_size = window_size
-
-    def clear(self):
-        self.V = 0
-        self.N = 0
-
-    def prepare_inputs(self, *inputs):
-        outputs = []
-        for i, inp in enumerate(inputs):
-            if torch.is_tensor(inp):
-                # 确保输入是 [B, C, H, W] 格式
-                if inp.dim() == 4 and inp.shape[-1] == 3:  # [B, H, W, 3] -> [B, 3, H, W]
-                    inp = inp.permute(0, 3, 1, 2)
-                inp = inp.to(torch.float32)  # 确保数据类型正确
-            outputs.append(inp)
-        return outputs
-
-    def update(self, preds, truths):
-        preds, truths = self.prepare_inputs(preds, truths)  # [B, 3, H, W], range in [0, 1]
-
-        # 计算SSIM
-        ssim_value = ssim(truths, preds, window_size=self.window_size, size_average=True)
-
-        self.V += ssim_value.item()
-        self.N += 1
-
-    def measure(self):
-        return self.V / self.N
-
-    def write(self, writer, global_step, prefix=""):
-        writer.add_scalar(os.path.join(prefix, "SSIM"), self.measure(), global_step)
-
-    def report(self):
-        return f'SSIM = {self.measure():.6f}'
 
 
-# 初始化所有的评估器
-lmd_meter = LMDMeter(backend='fan')
-psnr_meter = PSNRMeter()
-lpips_meter = LPIPSMeter()
-ssim_meter = SSIMMeter()  # 新增SSIM评估器
-
-# 清空所有评估器
-lmd_meter.clear()
-psnr_meter.clear()
-lpips_meter.clear()
-ssim_meter.clear()  # 清空SSIM评估器
-
-# 读取视频文件
-vid_path_1 = sys.argv[1]
-vid_path_2 = sys.argv[2]
-
-capture_1 = cv2.VideoCapture(vid_path_1)
-capture_2 = cv2.VideoCapture(vid_path_2)
-
-counter = 0
-while True:
-    ret_1, frame_1 = capture_1.read()
-    ret_2, frame_2 = capture_2.read()
-
-    if not ret_1 * ret_2:
-        break
-
-    # 转换颜色空间并归一化
-    inp_1 = torch.FloatTensor(frame_1[..., ::-1] / 255.0)[None, ...].cuda()
-    inp_2 = torch.FloatTensor(frame_2[..., ::-1] / 255.0)[None, ...].cuda()
-
-    # 更新所有评估器
-    lmd_meter.update(inp_1, inp_2)
-    psnr_meter.update(inp_1, inp_2)
-    lpips_meter.update(inp_1, inp_2)
-    ssim_meter.update(inp_1, inp_2)  # 更新SSIM评估器
-
-    counter += 1
-    if counter % 100 == 0:
-        print(counter)
-
-# 输出所有评估结果
-print(lmd_meter.report())
-print(psnr_meter.report())
-print(lpips_meter.report())
-print(ssim_meter.report())  # 输出SSIM结果
-'''
 lmd_meter = LMDMeter(backend='fan')
 psnr_meter = PSNRMeter()
 lpips_meter = LPIPSMeter()
@@ -302,4 +215,4 @@ while True:
 print(lmd_meter.report())
 print(psnr_meter.report())
 print(lpips_meter.report())
-'''
+
